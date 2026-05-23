@@ -23,31 +23,32 @@ from utils.save import *
 from utils.proto_model import *
 
 if __name__ =='__main__':
+    # 解析命令行参数
     parser = argparse.ArgumentParser()
-    #Hyperparameters
+    #Hyperparameters 超参数
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--rho', type=float, default=0.1)
     parser.add_argument('--nEpoch', type=int, default=100)
 
-    #Data Loading
+    #Data Loading 加载数据
     parser.add_argument('--dataset', type=str, default='CharacterTrajectories')
     parser.add_argument('--shot', type=int, default=1 ,choices=[1,10])
     parser.add_argument('--normalize', type=bool, default=False)
 
-    #Baseline Model
+    #Baseline Model 基线模型，默认使用 ResNet
     parser.add_argument('--model', type=str, default='resnet',choices=['resnet','tapnet'])
 
-    #SAM
+    #SAM 配置 SAM 
     parser.add_argument('--sam', type=bool, default=True)
     parser.add_argument('--optimizer', type=str, default='adam',choices=['sgd','adam'])
 
-    #Prototypical Loss
+    #Prototypical Loss 原型损失配置
     parser.add_argument('--prototypical_loss', type=bool, default=True)
 
-    #Other Parameters
+    #Other Parameters 其他参数
     parser.add_argument('--prototypical_loss_type',type=str, default='neg',choices=['neg','sim','cos','negexp'])
 
-    #Saving
+    #Saving Results 保存结果参数配置
     parser.add_argument('--save_dir', type=str, default='/content/classification_data/')
     parser.add_argument('--save_name', type=str, default='results.csv')
 
@@ -66,7 +67,7 @@ if __name__ =='__main__':
     os.makedirs(os.path.dirname(filepath), exist_ok=True) 
     df.to_csv(filepath, index=False)
 
-
+    # 进行训练
     for dataset_name in [args.dataset]:
         for shot_dir in [args.shot]:
             full_training(args)

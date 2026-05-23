@@ -23,7 +23,7 @@ class Dataset(Dataset):
     return self.len
   
 def load_data(args):
-    base_path = "./COSCO/Datasets/"
+    base_path = "./Datasets/"
     dataset = args.dataset
     shot = args.shot
     normalize_data = args.normalize
