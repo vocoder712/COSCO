@@ -1,7 +1,34 @@
-numpy
-torch
-torchvision
-pandas
-argparse
-aeon
-keras-self-attention
+# COSCO / TapNet 对比实验依赖锁版本.
+# Pinned dependency set for the COSCO / TapNet comparison.
+#
+# 注意 / Note:
+#   - torch / torchvision 必须从 PyTorch 自家 index 安装 GPU build,
+#     不要直接 `pip install -r requirements.txt`. 见 USAGE.md §1.2.
+#   - aeon 必须固定在 0.11.x, 1.4+ 已移除 TapNetClassifier.
+#   - tensorflow 选 2.15.x; 2.18 在 Windows + Python 3.11 上会触发 DLL 错误,
+#     2.10 不支持 Python 3.11.
+#   - keras_self_attention 是 aeon TapNet 的软依赖, 必须显式安装.
+#
+#   - Install torch / torchvision from PyTorch's own index for the GPU
+#     build; do NOT use plain `pip install -r requirements.txt`. See
+#     USAGE.md §1.2.
+#   - aeon must be pinned to 0.11.x; 1.4+ removed TapNetClassifier.
+#   - tensorflow 2.15.x is the sweet spot on Windows + Python 3.11
+#     (2.18 hits a DLL-init error, 2.10 does not ship for Python 3.11).
+#   - keras_self_attention is a soft dependency of aeon's TapNet that
+#     must be installed explicitly.
+
+# --- 通过 pytorch index 安装 / install via pytorch index ---
+# pip install --index-url https://download.pytorch.org/whl/cu124 \
+#     torch==2.5.1 torchvision==0.20.1
+torch==2.5.1
+torchvision==0.20.1
+
+# --- 通用 PyPI 依赖 / regular PyPI deps ---
+numpy==1.26.4
+pandas==2.0.3
+scikit-learn==1.5.2
+tabulate>=0.9
+aeon==0.11.1
+tensorflow==2.15.1
+keras_self_attention==0.51.0
