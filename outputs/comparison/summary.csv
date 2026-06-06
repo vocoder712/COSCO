@@ -1,0 +1,5 @@
+model,dataset,shot,accuracy,elapsed_sec,status
+resnet,SpokenArabicDigits,1,0.3860845839017735,2.6,ok
+tapnet,SpokenArabicDigits,1,0.13142337426102774,13.6,ok
+resnet,SpokenArabicDigits,10,0.7994542974079127,5.0,ok
+tapnet,SpokenArabicDigits,10,0.7412460209185994,23.5,ok
