@@ -102,6 +102,12 @@ questions.
   and then calls `full_training(args)`.
 - `compare_models.py` calls `load_data()` directly, runs each model/dataset/shot
   combination, catches per-combination failures, and records `status`.
+- `compare_quick_bench.py` resets random seeds for every dataset/shot run via
+  `stable_run_seed(base_seed, dataset, shot)`. This makes `cosco` and
+  `cosco_weighted` share the same ResNet initialization and DataLoader shuffle
+  for the same task, and makes results independent of model order. Use
+  `--deterministic_torch` to request deterministic PyTorch kernels where
+  available.
 - `utils/proto_model.py::proto_neg_train_model`:
   - selects CUDA if available;
   - constructs `ResNet(input_size=train_data.shape[-1], nb_classes=len(unique labels))`;

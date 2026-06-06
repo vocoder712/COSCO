@@ -1,0 +1,3 @@
+model,dataset,shot,accuracy,elapsed_sec,seed,status,cosco_variant
+cosco,BasicMotions,1,1.0,0.5,9895,ok,
+cosco_weighted,BasicMotions,1,1.0,0.0,9895,ok,weighted_close_gamma=1.0

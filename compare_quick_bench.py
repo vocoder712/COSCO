@@ -9,6 +9,7 @@ ResNet, and COSCO on a small set of datasets and both 1-shot / 10-shot splits.
 
 import argparse
 import os
+import random
 import sys
 import time
 from argparse import Namespace
@@ -29,11 +30,29 @@ from utils.proto_model import proto_neg_train_model, weighted_proto_neg_train_mo
 MODEL_CHOICES = ["ed_1nn", "dtw_1nn", "tapnet", "resnet", "cosco", "cosco_weighted"]
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic_torch: bool = False) -> None:
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic_torch
+    if deterministic_torch:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def stable_run_seed(base_seed: int, dataset: str, shot: int) -> int:
+    """
+    Derive a model-order-independent seed for one dataset/shot task.
+
+    COSCO and COSCO-weighted intentionally share the same seed for the same
+    dataset/shot, so their ResNet initialization and DataLoader shuffle are
+    comparable.
+    """
+    key = f"{dataset}:{shot}"
+    key_value = sum((i + 1) * ord(ch) for i, ch in enumerate(key))
+    return (base_seed + key_value) % (2 ** 31 - 1)
 
 
 def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
@@ -55,6 +74,7 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         dummy_cosco_improvement=args.dummy_cosco_improvement,
         weighted_proto_gamma=args.weighted_proto_gamma,
         weighted_proto_mode=args.weighted_proto_mode,
+        seed=args.seed,
     )
 
 
@@ -252,6 +272,8 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         f.write(f"- epochs for neural models: {args.nEpoch}\n")
         f.write(f"- datasets: `{', '.join(args.datasets)}`\n")
         f.write(f"- shots: `{', '.join(map(str, args.shots))}`\n")
+        f.write(f"- base seed: `{args.seed}`\n")
+        f.write(f"- deterministic torch: `{args.deterministic_torch}`\n")
         f.write(f"- COSCO variant: `{'dummy_noop' if args.dummy_cosco_improvement else 'original'}`\n\n")
         f.write(f"- weighted prototype gamma: `{args.weighted_proto_gamma}`\n")
         f.write(f"- weighted prototype distance mode: `{args.weighted_proto_mode}`\n\n")
@@ -271,7 +293,7 @@ def main() -> None:
         description="Quick benchmark for COSCO improvement iterations."
     )
     parser.add_argument("--datasets", nargs="+",
-                        default=["SpokenArabicDigits", "RacketSports"])
+                        default=["SpokenArabicDigits", "RacketSports", "Heartbeat", "JapaneseVowels", "Libras"],)
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 10],
                         choices=[1, 10])
     parser.add_argument("--models", nargs="+", default=["cosco", "cosco_weighted"],
@@ -281,7 +303,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--rho", type=float, default=0.1)
     parser.add_argument("--normalize", action="store_true")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=10)
+    parser.add_argument("--deterministic_torch", action="store_true",
+                        help="Request deterministic PyTorch kernels where available.")
     parser.add_argument("--out_dir", default="outputs/quick_bench/")
     parser.add_argument("--dummy_cosco_improvement", action="store_true",
                         help="Enable the no-op COSCO improvement hook.")
@@ -292,10 +316,7 @@ def main() -> None:
                         help="'close' uses softmax(-distance/gamma); 'far' uses softmax(distance/gamma).")
     args = parser.parse_args()
 
-    if len(args.datasets) > 3:
-        raise ValueError("Use at most 3 datasets for the quick benchmark.")
-
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic_torch=args.deterministic_torch)
     os.makedirs(args.out_dir, exist_ok=True)
 
     device_str = (
@@ -311,6 +332,8 @@ def main() -> None:
                 tag = f"{model:<8} | {dataset:<14} | {shot}-shot"
                 print(f"\n[run] {tag}")
                 t0 = time.time()
+                run_seed = stable_run_seed(args.seed, dataset, shot)
+                set_seed(run_seed, deterministic_torch=args.deterministic_torch)
                 run_args = make_run_args(args, dataset, shot, model)
                 try:
                     acc = run_single(run_args)
@@ -327,6 +350,7 @@ def main() -> None:
                     "shot": shot,
                     "accuracy": acc,
                     "elapsed_sec": elapsed,
+                    "seed": run_seed,
                     "status": status,
                     "cosco_variant": (
                         "dummy_noop"
