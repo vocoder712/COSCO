@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from Prototypical_Loss import PrototypicalLoss
+from Prototypical_Loss import PrototypicalLoss, WeightedPrototypicalLoss
 from Prototypical_Loss import prototypical_testing as ptest
 from Baselines.ResNet import *
 from Baselines.TapNet import train_tapnet  # 让 full_training 能在 tapnet 分支调用
@@ -69,7 +69,8 @@ def enable_running_stats(model):
     model.apply(_enable)
 
 
-def proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
+def proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args,
+                          criterion_override=None, centroid_path='train_centroids.pt'):
     """
     使用 ResNet + SAM + Prototypical Loss(neg) 完成 COSCO 主流程.
 
@@ -114,8 +115,10 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     runSAM = args.sam
     optimizer = args.optimizer
 
-    # 选择原型损失的 negative-distance 变体 / pick the neg-distance variant
-    criterion = PrototypicalLoss(flag='neg')
+    # 选择原型损失的 negative-distance 变体 / pick the neg-distance variant.
+    # `criterion_override` is used only by experimental COSCO variants; the
+    # original COSCO call path keeps the mean-centroid PrototypicalLoss.
+    criterion = criterion_override or PrototypicalLoss(flag='neg')
 
     # 是否启用 Sharpness-Aware Minimization
     # Decide whether to wrap the base optimiser with SAM.
@@ -200,7 +203,7 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
 
     # 保存训练集原型, 后续推理 / 复现都依赖它
     # Persist the training centroids; both inference and reproduction rely on them.
-    torch.save(train_centroids, 'train_centroids.pt')
+    torch.save(train_centroids, centroid_path)
 
     # ---------- 测试阶段 / inference & evaluation ----------
     test_data = torch.from_numpy(test_data).float()
@@ -210,7 +213,7 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     pred, embed = model_resnet(test_data.transpose(1, 2).float())
 
     # 加载训练集原型 / reload the saved centroids
-    train_centroids = torch.load('train_centroids.pt')
+    train_centroids = torch.load(centroid_path)
 
     # 最近原型分类 / nearest-centroid prediction
     predicted_test_labels = ptest(embed, train_centroids)
@@ -224,6 +227,33 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
 
     print("Final Accuracy: ", acc)
     return acc
+
+
+def weighted_proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
+    """
+    COSCO variant using weighted prototypical centroids.
+
+    The original COSCO implementation is preserved in `proto_neg_train_model`.
+    This wrapper swaps only the centroid computation inside the prototypical
+    loss: mean centroid -> distance-softmax weighted centroid.
+    """
+    gamma = getattr(args, 'weighted_proto_gamma', 1.0)
+    distance_mode = getattr(args, 'weighted_proto_mode', 'close')
+    criterion = WeightedPrototypicalLoss(
+        flag='neg',
+        gamma=gamma,
+        distance_mode=distance_mode,
+    )
+    return proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+        criterion_override=criterion,
+        centroid_path='train_centroids_weighted.pt',
+    )
 
 
 def full_training(args):
@@ -288,4 +318,3 @@ def full_training(args):
     save_to_dataframe(acc, args)
 
     return acc
-

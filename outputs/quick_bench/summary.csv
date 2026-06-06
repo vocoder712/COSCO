@@ -1,0 +1,9 @@
+model,dataset,shot,accuracy,elapsed_sec,status,cosco_variant
+cosco,SpokenArabicDigits,1,0.38153706230104595,2.1,ok,
+cosco_weighted,SpokenArabicDigits,1,0.37335152341973626,2.1,ok,weighted_close_gamma=1.0
+cosco,SpokenArabicDigits,10,0.7603456116416553,2.3,ok,
+cosco_weighted,SpokenArabicDigits,10,0.7735334242837654,2.7,ok,weighted_close_gamma=1.0
+cosco,RacketSports,1,0.4473684210526316,1.3,ok,
+cosco_weighted,RacketSports,1,0.39473684210526316,1.5,ok,weighted_close_gamma=1.0
+cosco,RacketSports,10,0.8157894736842105,1.3,ok,
+cosco_weighted,RacketSports,10,0.8355263157894737,1.5,ok,weighted_close_gamma=1.0

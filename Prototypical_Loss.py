@@ -139,6 +139,47 @@ class PrototypicalLoss:
             return self._prototypical_loss_negexp(distance, label)
 
 
+class WeightedPrototypicalLoss(PrototypicalLoss):
+    """
+    Prototypical Loss with weighted class centroids.
+
+    For each class, first compute the original mean centroid, then compute the
+    L2 distance from every sample embedding in that class to the mean centroid.
+    A softmax over those distances gives sample weights, and the final centroid
+    is the weighted sum of class embeddings.
+    """
+
+    def __init__(self, flag='neg', gamma=1.0, distance_mode='close'):
+        super().__init__(flag=flag)
+        if gamma <= 0:
+            raise ValueError(f"gamma must be positive, got {gamma}")
+        if distance_mode not in {'close', 'far'}:
+            raise ValueError("distance_mode must be 'close' or 'far'")
+        self.gamma = gamma
+        self.distance_mode = distance_mode
+
+    def _compute_per_class_centroid(self, i, label, data):
+        """
+        Compute one weighted centroid.
+
+        `distance_mode='close'` uses softmax(-distance / gamma), so samples
+        closer to the original mean get larger weights. `far` uses the literal
+        softmax(distance / gamma), giving farther samples larger weights.
+        """
+        label1d = label.squeeze()
+        data_class = data[label1d == i, :]
+        mean_centroid = torch.mean(data_class, 0, True)
+
+        distances = torch.norm(data_class - mean_centroid, p=2, dim=1)
+        logits = distances / self.gamma
+        if self.distance_mode == 'close':
+            logits = -logits
+
+        weights = torch.softmax(logits, dim=0).view(-1, 1)
+        weighted_centroid = torch.sum(data_class * weights, dim=0, keepdim=True)
+        return weighted_centroid
+
+
 def prototypical_testing(test_embed, train_centroids):
     """
     最近原型分类 / nearest-centroid classification at inference time.

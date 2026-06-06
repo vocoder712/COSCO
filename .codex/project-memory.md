@@ -23,11 +23,17 @@ questions.
 - `run.py`: single experiment CLI entry point.
 - `compare_models.py`: added comparison runner for multiple datasets, shots,
   and models; writes `outputs/comparison/summary.csv` and `.md`.
+- `compare_quick_bench.py`: quick smoke benchmark for COSCO improvement
+  iterations. It compares `ed_1nn`, `dtw_1nn`, `tapnet`, supervised `resnet`,
+  `cosco`, and `cosco_weighted`; includes a `--dummy_cosco_improvement` no-op
+  hook.
 - `utils/load_data.py`: loads `Datasets/<dataset>/{1,10}-shot/*.npy` and full
   test splits; wraps arrays in a torch `Dataset`.
 - `utils/proto_model.py`: core COSCO training/evaluation loop.
 - `Prototypical_Loss.py`: prototypical loss variants and nearest-centroid
-  inference.
+  inference. Also contains `WeightedPrototypicalLoss`, a COSCO improvement
+  variant that computes mean centroids first, then L2 distances to that mean,
+  then softmax distance weights, then a weighted centroid.
 - `SAM.py`: SAM optimizer implementation.
 - `Baselines/ResNet.py`: ResNet backbone. `forward()` returns `(log_probs,
   embedding)`.
@@ -83,6 +89,10 @@ questions.
   `conda run -n cosco --no-capture-output python run.py --dataset BasicMotions --model tapnet --shot 1 --nEpoch 100 --save_dir outputs/ --save_name tapnet_basicmotions_1shot.csv`
 - Comparison sweep:
   `conda run -n cosco --no-capture-output python compare_models.py --datasets BasicMotions Epilepsy --shots 1 10 --models resnet tapnet --nEpoch 100 --out_dir outputs/comparison/`
+- Quick improvement benchmark:
+  `conda run -n cosco --no-capture-output python compare_quick_bench.py --datasets BasicMotions RacketSports --shots 1 10 --models ed_1nn dtw_1nn tapnet resnet cosco --nEpoch 5 --dummy_cosco_improvement --out_dir outputs/quick_bench/`
+- Quick original-vs-weighted COSCO smoke:
+  `conda run -n cosco --no-capture-output python compare_quick_bench.py --datasets BasicMotions --shots 1 10 --models cosco cosco_weighted --nEpoch 2 --weighted_proto_gamma 1.0 --weighted_proto_mode close --out_dir outputs/quick_bench_weighted_smoke/`
 - GPU sanity check:
   `conda run -n cosco --no-capture-output python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"`
 
@@ -101,6 +111,17 @@ questions.
   - collects final-epoch embeddings to compute train centroids;
   - saves centroids to root `train_centroids.pt`;
   - evaluates by nearest-centroid classification on test embeddings.
+- `utils/proto_model.py::weighted_proto_neg_train_model` preserves original
+  COSCO by wrapping the same training loop with `WeightedPrototypicalLoss`.
+  It writes centroids to `train_centroids_weighted.pt`.
+- Weighted prototype details:
+  - original mean centroid is computed per class;
+  - per-sample L2 distance to that mean is computed;
+  - `--weighted_proto_gamma` controls softmax temperature;
+  - `--weighted_proto_mode close` uses `softmax(-distance / gamma)`, giving
+    closer samples larger weights;
+  - `--weighted_proto_mode far` uses the literal `softmax(distance / gamma)`,
+    giving farther samples larger weights.
 - Windows-specific fix: DataLoader uses `num_workers=0` in the main COSCO path
   to avoid spawn/pickling issues.
 - TapNet wrapper lazily imports `TapNetClassifier`, so importing
@@ -121,6 +142,19 @@ questions.
   scored `1.0000` for both 1-shot and 10-shot and TapNet scored `0.5750` /
   `0.7000`. Treat that as documented example output, not the currently opened
   `outputs/comparison` state.
+- Current `outputs/quick_bench/summary.md` is a quick smoke benchmark, not a
+  final paper-quality benchmark. It used 5 epochs for neural models, datasets
+  `BasicMotions` and `RacketSports`, both 1-shot and 10-shot, and the no-op
+  `dummy_noop` COSCO hook.
+- Quick benchmark accuracies:
+  - `BasicMotions` 1-shot: COSCO `1.0000`, DTW-1NN `0.8000`, ED-1NN `0.4250`,
+    ResNet `0.3250`, TapNet `0.3500`.
+  - `BasicMotions` 10-shot: COSCO `1.0000`, DTW-1NN `0.9750`, ED-1NN `0.6000`,
+    ResNet `0.2500`, TapNet `0.3500`.
+  - `RacketSports` 1-shot: COSCO `0.3553`, DTW-1NN `0.5197`, ED-1NN `0.3553`,
+    ResNet `0.3026`, TapNet `0.2763`.
+  - `RacketSports` 10-shot: COSCO `0.7237`, DTW-1NN `0.8487`, ED-1NN `0.6908`,
+    ResNet `0.2632`, TapNet `0.2961`.
 
 ## Known Pitfalls
 
@@ -151,4 +185,3 @@ questions.
   - untracked: `outputs/`
 - This memory file and `.codex/` were added after that snapshot.
 - Do not revert user/generated artifacts unless explicitly asked.
-
