@@ -1,0 +1,3 @@
+model,dataset,shot,accuracy,elapsed_sec,seed,status,cosco_variant,rho_min,rho_mean,rho_max,rho_final,proto_stress_mean,proto_stress_final
+cosco,BasicMotions,10,1.0,0.4,10502,ok,,,,,,,
+cosco_dynamic_rho,BasicMotions,10,1.0,0.0,10502,ok,dynamic_rho_proto_geometry_alpha=0.5,0.12254957854747772,0.12254957854747772,0.12254957854747772,0.12254957854747772,0.45099157094955444,0.45099157094955444

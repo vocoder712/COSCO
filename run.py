@@ -51,6 +51,8 @@ if __name__ == '__main__':
                         help='SAM 邻域半径 / SAM neighbourhood radius rho')
     parser.add_argument('--nEpoch', type=int, default=100,
                         help='训练轮数 / number of epochs')
+    parser.add_argument('--log_every', type=int, default=1,
+                        help='每 N 个 epoch 打印一次日志, 0 表示关闭 / print every N epochs, 0 disables')
 
     # 数据加载 / Data loading
     parser.add_argument('--dataset', type=str, default='CharacterTrajectories',
@@ -71,6 +73,14 @@ if __name__ == '__main__':
     parser.add_argument('--optimizer', type=str, default='adam',
                         choices=['sgd', 'adam'],
                         help='SAM 之下的基础优化器 / base optimiser used inside SAM')
+    parser.add_argument('--dynamic_rho', action='store_true',
+                        help='按原型几何压力动态调整 SAM rho / adapt SAM rho by prototype geometry')
+    parser.add_argument('--dynamic_rho_alpha', type=float, default=0.25,
+                        help='动态 rho 的原型几何压力系数 / prototype-geometry stress multiplier')
+    parser.add_argument('--dynamic_rho_min_ratio', type=float, default=0.5,
+                        help='动态 rho 下界, 相对 --rho 的比例 / minimum dynamic rho ratio')
+    parser.add_argument('--dynamic_rho_max_ratio', type=float, default=1.15,
+                        help='动态 rho 上界, 相对 --rho 的比例 / maximum dynamic rho ratio')
 
     # Prototypical Loss 原型损失配置
     parser.add_argument('--prototypical_loss', type=bool, default=True,

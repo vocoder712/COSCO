@@ -1,6 +1,6 @@
 # COSCO Project Memory
 
-Last updated: 2026-06-06
+Last updated: 2026-06-28
 
 This file is persistent local memory for future Codex conversations in this
 repository. Read it before making changes or answering project-specific
@@ -25,8 +25,9 @@ questions.
   and models; writes `outputs/comparison/summary.csv` and `.md`.
 - `compare_quick_bench.py`: quick smoke benchmark for COSCO improvement
   iterations. It compares `ed_1nn`, `dtw_1nn`, `tapnet`, supervised `resnet`,
-  `cosco`, and `cosco_weighted`; includes a `--dummy_cosco_improvement` no-op
-  hook.
+  `cosco`, `cosco_weighted`, and `cosco_dynamic_rho`; includes a
+  `--dummy_cosco_improvement` no-op hook. Default quick comparison is now
+  `cosco` vs `cosco_dynamic_rho`.
 - `utils/load_data.py`: loads `Datasets/<dataset>/{1,10}-shot/*.npy` and full
   test splits; wraps arrays in a torch `Dataset`.
 - `utils/proto_model.py`: core COSCO training/evaluation loop.
@@ -93,6 +94,8 @@ questions.
   `conda run -n cosco --no-capture-output python compare_quick_bench.py --datasets BasicMotions RacketSports --shots 1 10 --models ed_1nn dtw_1nn tapnet resnet cosco --nEpoch 5 --dummy_cosco_improvement --out_dir outputs/quick_bench/`
 - Quick original-vs-weighted COSCO smoke:
   `conda run -n cosco --no-capture-output python compare_quick_bench.py --datasets BasicMotions --shots 1 10 --models cosco cosco_weighted --nEpoch 2 --weighted_proto_gamma 1.0 --weighted_proto_mode close --out_dir outputs/quick_bench_weighted_smoke/`
+- Quick dynamic-rho COSCO benchmark:
+  `conda run -n cosco --no-capture-output python compare_quick_bench.py --log_every 0 --out_dir outputs/quick_bench_dynamic_rho_a025_m115/`
 - GPU sanity check:
   `conda run -n cosco --no-capture-output python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"`
 
@@ -108,6 +111,11 @@ questions.
   for the same task, and makes results independent of model order. Use
   `--deterministic_torch` to request deterministic PyTorch kernels where
   available.
+- `compare_quick_bench.py` also supports `cosco_dynamic_rho`, which uses the
+  same per-dataset/shot seed as `cosco`. It writes accuracy deltas plus
+  `rho_min/rho_mean/rho_max/rho_final` and prototype-stress statistics into
+  the CSV/Markdown summaries. Use `--log_every 0` to suppress epoch logs during
+  sweeps.
 - `utils/proto_model.py::proto_neg_train_model`:
   - selects CUDA if available;
   - constructs `ResNet(input_size=train_data.shape[-1], nb_classes=len(unique labels))`;
@@ -120,6 +128,17 @@ questions.
 - `utils/proto_model.py::weighted_proto_neg_train_model` preserves original
   COSCO by wrapping the same training loop with `WeightedPrototypicalLoss`.
   It writes centroids to `train_centroids_weighted.pt`.
+- Dynamic SAM-rho details:
+  - `cosco_dynamic_rho` keeps the original mean-prototype loss but adapts SAM
+    `rho` before `optimizer.first_step()`;
+  - prototype geometry pressure is
+    `mean(distance_to_own_prototype) / mean(distance_to_nearest_other_prototype)`;
+  - dynamic rho uses
+    `rho_base * clamp(1 + alpha * stress, min_ratio, max_ratio)`;
+  - current default dynamic-rho parameters are `alpha=0.25`,
+    `min_ratio=0.5`, `max_ratio=1.15`, with base `rho=0.1`;
+  - `1-shot` usually has zero prototype stress because each class has one
+    support sample, so dynamic rho stays at the base value.
 - Weighted prototype details:
   - original mean centroid is computed per class;
   - per-sample L2 distance to that mean is computed;
@@ -161,6 +180,30 @@ questions.
     ResNet `0.3026`, TapNet `0.2763`.
   - `RacketSports` 10-shot: COSCO `0.7237`, DTW-1NN `0.8487`, ED-1NN `0.6908`,
     ResNet `0.2632`, TapNet `0.2961`.
+- Dynamic-rho iteration report:
+  - Weekly report path:
+    `outputs/quick_bench_dynamic_rho_a025_m115/dynamic_rho_weekly_report.md`.
+  - Best current dynamic-rho quick-bench output:
+    `outputs/quick_bench_dynamic_rho_a025_m115/summary.md`.
+  - Tested datasets: `SpokenArabicDigits`, `RacketSports`, `Heartbeat`,
+    `JapaneseVowels`, `Libras`; shots: `1` and `10`; neural epochs: `100`.
+  - Mean accuracy over the 10 dataset/shot tasks:
+    `cosco = 0.661237`, `cosco_dynamic_rho = 0.663100`,
+    mean delta `+0.001863`.
+  - Wins/ties/losses by task: `3 / 3 / 4`.
+  - Biggest gains: `RacketSports` 1-shot `+0.0197`, `RacketSports` 10-shot
+    `+0.0132`, `SpokenArabicDigits` 10-shot `+0.0018`.
+  - Remaining drops: `Libras` 1-shot/10-shot `-0.0056`,
+    `JapaneseVowels` 10-shot `-0.0027`, `SpokenArabicDigits` 1-shot `-0.0023`.
+  - Interpretation: dynamic rho is a weak positive baseline, not a strong
+    stable improvement. Monotonically increasing rho with prototype stress was
+    harmful when too aggressive (`alpha=1.0,max_ratio=2.0`) and still risky for
+    high-stress datasets. The current conservative default only barely clears
+    original COSCO on average.
+  - Suggested next work: try window/protective dynamic rho, prototype-margin
+    driven rho, SAM sharpness-gap driven rho, or shift to DTW-distance
+    distillation / pairwise metric loss / augmentation consistency for stronger
+    embedding improvements.
 
 ## Known Pitfalls
 
@@ -168,6 +211,10 @@ questions.
   `./Datasets/`; run commands from the repository root.
 - `train_centroids.pt` is a generated artifact and is overwritten by each COSCO
   ResNet training run. It does not include the trained ResNet `state_dict`.
+- `compare_quick_bench.py` uses `train_centroids_quick_bench.pt` for original
+  COSCO and `train_centroids_dynamic_rho.pt` for dynamic rho to avoid further
+  overwriting root `train_centroids.pt` during quick-bench sweeps. Older runs
+  may already have modified `train_centroids.pt`.
 - For long-lived inference, add explicit checkpoint saving in
   `utils/proto_model.py::proto_neg_train_model`, for example
   `torch.save(model_resnet.state_dict(), 'resnet.pt')`.

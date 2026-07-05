@@ -27,7 +27,15 @@ from utils.load_data import Dataset, load_data
 from utils.proto_model import proto_neg_train_model, weighted_proto_neg_train_model
 
 
-MODEL_CHOICES = ["ed_1nn", "dtw_1nn", "tapnet", "resnet", "cosco", "cosco_weighted"]
+MODEL_CHOICES = [
+    "ed_1nn",
+    "dtw_1nn",
+    "tapnet",
+    "resnet",
+    "cosco",
+    "cosco_weighted",
+    "cosco_dynamic_rho",
+]
 
 
 def set_seed(seed: int, deterministic_torch: bool = False) -> None:
@@ -74,6 +82,12 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         dummy_cosco_improvement=args.dummy_cosco_improvement,
         weighted_proto_gamma=args.weighted_proto_gamma,
         weighted_proto_mode=args.weighted_proto_mode,
+        dynamic_rho=(model == "cosco_dynamic_rho"),
+        dynamic_rho_alpha=args.dynamic_rho_alpha,
+        dynamic_rho_min_ratio=args.dynamic_rho_min_ratio,
+        dynamic_rho_max_ratio=args.dynamic_rho_max_ratio,
+        dynamic_rho_summary={},
+        log_every=args.log_every,
         seed=args.seed,
     )
 
@@ -207,6 +221,7 @@ def run_cosco(train_data: np.ndarray, train_label: np.ndarray,
         test_label,
         input_size,
         args,
+        centroid_path="train_centroids_quick_bench.pt",
     ))
 
 
@@ -226,6 +241,27 @@ def run_cosco_weighted(train_data: np.ndarray, train_label: np.ndarray,
         test_label,
         input_size,
         args,
+    ))
+
+
+def run_cosco_dynamic_rho(train_data: np.ndarray, train_label: np.ndarray,
+                          test_data: np.ndarray, test_label: np.ndarray,
+                          input_size: int, args: Namespace) -> float:
+    args.dynamic_rho = True
+    trainloader = DataLoader(
+        Dataset(train_data, train_label),
+        batch_size=1024,
+        shuffle=True,
+        num_workers=0,
+    )
+    return float(proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+        centroid_path="train_centroids_dynamic_rho.pt",
     ))
 
 
@@ -249,6 +285,9 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_weighted":
         return run_cosco_weighted(train_data, train_label, test_data, test_label,
                                   input_size, run_args)
+    if run_args.model == "cosco_dynamic_rho":
+        return run_cosco_dynamic_rho(train_data, train_label, test_data, test_label,
+                                     input_size, run_args)
 
     raise ValueError(f"Unknown model: {run_args.model}")
 
@@ -265,6 +304,38 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         values="accuracy",
         aggfunc="first",
     )
+    accuracy_view = pivot.copy()
+    if {"cosco", "cosco_dynamic_rho"}.issubset(set(accuracy_view.columns)):
+        accuracy_view["dynamic_minus_cosco"] = (
+            accuracy_view["cosco_dynamic_rho"] - accuracy_view["cosco"]
+        )
+
+    dynamic_rho_cols = [
+        "dataset",
+        "shot",
+        "rho_min",
+        "rho_mean",
+        "rho_max",
+        "rho_final",
+        "proto_stress_mean",
+        "proto_stress_final",
+    ]
+    dynamic_rho_rows = pd.DataFrame()
+    if set(dynamic_rho_cols).issubset(df.columns):
+        dynamic_rho_rows = df.loc[
+            df["model"] == "cosco_dynamic_rho",
+            dynamic_rho_cols,
+        ].copy()
+    dynamic_effect_rows = pd.DataFrame()
+    if (
+        not dynamic_rho_rows.empty
+        and {"cosco", "cosco_dynamic_rho", "dynamic_minus_cosco"}.issubset(set(accuracy_view.columns))
+    ):
+        dynamic_effect_rows = accuracy_view.reset_index()[
+            ["dataset", "shot", "cosco", "cosco_dynamic_rho", "dynamic_minus_cosco"]
+        ].merge(dynamic_rho_rows, on=["dataset", "shot"], how="inner")
+        dynamic_effect_rows["rho_mean_ratio"] = dynamic_effect_rows["rho_mean"] / args.rho
+        dynamic_effect_rows["rho_max_ratio"] = dynamic_effect_rows["rho_max"] / args.rho
 
     with open(summary_md, "w", encoding="utf-8") as f:
         f.write("# Quick COSCO Benchmark\n\n")
@@ -277,7 +348,16 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         f.write(f"- COSCO variant: `{'dummy_noop' if args.dummy_cosco_improvement else 'original'}`\n\n")
         f.write(f"- weighted prototype gamma: `{args.weighted_proto_gamma}`\n")
         f.write(f"- weighted prototype distance mode: `{args.weighted_proto_mode}`\n\n")
-        f.write(pivot.to_markdown(floatfmt=".4f"))
+        f.write(f"- dynamic rho alpha: `{args.dynamic_rho_alpha}`\n")
+        f.write(f"- dynamic rho min ratio: `{args.dynamic_rho_min_ratio}`\n")
+        f.write(f"- dynamic rho max ratio: `{args.dynamic_rho_max_ratio}`\n\n")
+        f.write(accuracy_view.to_markdown(floatfmt=".4f"))
+        if not dynamic_effect_rows.empty:
+            f.write("\n\n## Dynamic rho effect\n\n")
+            f.write(dynamic_effect_rows.to_markdown(index=False, floatfmt=".6f"))
+        if not dynamic_rho_rows.empty:
+            f.write("\n\n## Dynamic rho summary\n\n")
+            f.write(dynamic_rho_rows.to_markdown(index=False, floatfmt=".6f"))
         f.write("\n\n## Full rows\n\n")
         f.write(df.to_markdown(index=False, floatfmt=".4f"))
         f.write("\n")
@@ -285,7 +365,19 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
     print(f"\n[saved] {summary_csv}")
     print(f"[saved] {summary_md}")
     print("\n=== Accuracy comparison ===")
-    print(pivot.to_string(float_format=lambda x: f"{x:.4f}"))
+    print(accuracy_view.to_string(float_format=lambda x: f"{x:.4f}"))
+    if not dynamic_effect_rows.empty:
+        print("\n=== Dynamic rho effect ===")
+        print(dynamic_effect_rows.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}",
+        ))
+    if not dynamic_rho_rows.empty:
+        print("\n=== Dynamic rho summary ===")
+        print(dynamic_rho_rows.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}",
+        ))
 
 
 def main() -> None:
@@ -296,7 +388,7 @@ def main() -> None:
                         default=["SpokenArabicDigits", "RacketSports", "Heartbeat", "JapaneseVowels", "Libras"],)
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 10],
                         choices=[1, 10])
-    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_weighted"],
+    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_dynamic_rho"],
                         choices=MODEL_CHOICES)
     parser.add_argument("--nEpoch", type=int, default=100,
                         help="Epochs for TapNet, supervised ResNet, and COSCO.")
@@ -314,6 +406,14 @@ def main() -> None:
     parser.add_argument("--weighted_proto_mode", choices=["close", "far"],
                         default="close",
                         help="'close' uses softmax(-distance/gamma); 'far' uses softmax(distance/gamma).")
+    parser.add_argument("--dynamic_rho_alpha", type=float, default=0.25,
+                        help="Prototype-geometry stress multiplier for dynamic SAM rho.")
+    parser.add_argument("--dynamic_rho_min_ratio", type=float, default=0.5,
+                        help="Minimum dynamic rho as a ratio of --rho.")
+    parser.add_argument("--dynamic_rho_max_ratio", type=float, default=1.15,
+                        help="Maximum dynamic rho as a ratio of --rho.")
+    parser.add_argument("--log_every", type=int, default=1,
+                        help="Print COSCO epoch logs every N epochs; 0 disables epoch logs.")
     args = parser.parse_args()
 
     set_seed(args.seed, deterministic_torch=args.deterministic_torch)
@@ -344,6 +444,7 @@ def main() -> None:
                     print(f"[err] {tag}: {status}", file=sys.stderr)
 
                 elapsed = round(time.time() - t0, 1)
+                dynamic_summary = getattr(run_args, "dynamic_rho_summary", {}) or {}
                 rows.append({
                     "model": model,
                     "dataset": dataset,
@@ -358,9 +459,19 @@ def main() -> None:
                         else (
                             f"weighted_{args.weighted_proto_mode}_gamma={args.weighted_proto_gamma}"
                             if model == "cosco_weighted"
-                            else ""
+                            else (
+                                f"dynamic_rho_proto_geometry_alpha={args.dynamic_rho_alpha}"
+                                if model == "cosco_dynamic_rho"
+                                else ""
+                            )
                         )
                     ),
+                    "rho_min": dynamic_summary.get("rho_min", np.nan),
+                    "rho_mean": dynamic_summary.get("rho_mean", np.nan),
+                    "rho_max": dynamic_summary.get("rho_max", np.nan),
+                    "rho_final": dynamic_summary.get("rho_final", np.nan),
+                    "proto_stress_mean": dynamic_summary.get("proto_stress_mean", np.nan),
+                    "proto_stress_final": dynamic_summary.get("proto_stress_final", np.nan),
                 })
                 print(f"[done] {tag} -> acc={acc:.4f} ({elapsed}s, {status})")
 

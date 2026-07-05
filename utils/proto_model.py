@@ -69,6 +69,63 @@ def enable_running_stats(model):
     model.apply(_enable)
 
 
+def _prototype_geometry_stress(embed, labels, eps=1e-12):
+    """
+    Compute a batch-level prototype-geometry pressure score.
+
+    The score is the mean distance to the sample's own class prototype divided
+    by the mean distance to the nearest other class prototype. It is small when
+    classes are compact and well separated, and larger when within-class spread
+    is high relative to between-class separation.
+    """
+    with torch.no_grad():
+        labels = labels.squeeze().long()
+        unique_labels = torch.unique(labels, sorted=True)
+        if unique_labels.numel() < 2:
+            return embed.new_tensor(0.0)
+
+        centroids = []
+        target_indices = torch.empty_like(labels, dtype=torch.long)
+        for class_index, class_label in enumerate(unique_labels):
+            mask = labels == class_label
+            if not torch.any(mask):
+                continue
+            centroids.append(embed[mask].mean(dim=0))
+            target_indices[mask] = class_index
+
+        if len(centroids) < 2:
+            return embed.new_tensor(0.0)
+
+        centroids = torch.stack(centroids, dim=0)
+        distances = torch.cdist(embed, centroids, p=2)
+        own_dist = distances.gather(1, target_indices.view(-1, 1)).squeeze(1)
+
+        other_distances = distances.clone()
+        other_distances.scatter_(1, target_indices.view(-1, 1), float("inf"))
+        nearest_other_dist = other_distances.min(dim=1).values
+        finite_mask = torch.isfinite(nearest_other_dist)
+        if not torch.any(finite_mask):
+            return embed.new_tensor(0.0)
+
+        own_mean = own_dist[finite_mask].mean()
+        other_mean = nearest_other_dist[finite_mask].mean()
+        stress = own_mean / (other_mean + eps)
+        return torch.nan_to_num(stress, nan=0.0, posinf=1e6, neginf=0.0)
+
+
+def _set_sam_rho(optimizer, rho):
+    """Update rho for every SAM parameter group."""
+    for group in optimizer.param_groups:
+        group["rho"] = rho
+
+
+def _compute_dynamic_rho(base_rho, stress, alpha, min_ratio, max_ratio):
+    scaled_rho = base_rho * (1.0 + alpha * stress)
+    min_rho = base_rho * min_ratio
+    max_rho = base_rho * max_ratio
+    return max(min(scaled_rho, max_rho), min_rho)
+
+
 def proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args,
                           criterion_override=None, centroid_path='train_centroids.pt'):
     """
@@ -111,6 +168,11 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     lr = args.lr
     rho = args.rho
     nEpoch = args.nEpoch
+    dynamic_rho = bool(getattr(args, 'dynamic_rho', False))
+    dynamic_rho_alpha = float(getattr(args, 'dynamic_rho_alpha', 0.25))
+    dynamic_rho_min_ratio = float(getattr(args, 'dynamic_rho_min_ratio', 0.5))
+    dynamic_rho_max_ratio = float(getattr(args, 'dynamic_rho_max_ratio', 1.15))
+    log_every = int(getattr(args, 'log_every', 1))
 
     runSAM = args.sam
     optimizer = args.optimizer
@@ -129,8 +191,26 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
         optimizer = SAM(model_resnet.parameters(), base_optimizer,
                         lr=lr, momentum=0.9, rho=rho)
 
+    if dynamic_rho and runSAM is False:
+        dynamic_rho = False
+    if dynamic_rho:
+        if rho < 0:
+            raise ValueError(f"rho must be non-negative, got {rho}")
+        if dynamic_rho_alpha < 0:
+            raise ValueError(f"dynamic_rho_alpha must be non-negative, got {dynamic_rho_alpha}")
+        if dynamic_rho_min_ratio < 0:
+            raise ValueError(f"dynamic_rho_min_ratio must be non-negative, got {dynamic_rho_min_ratio}")
+        if dynamic_rho_min_ratio > dynamic_rho_max_ratio:
+            raise ValueError(
+                "dynamic_rho_min_ratio must be <= dynamic_rho_max_ratio, "
+                f"got {dynamic_rho_min_ratio} > {dynamic_rho_max_ratio}"
+            )
+
     # 模型搬到目标设备 / move model to target device
     model_resnet = model_resnet.to(device)
+    args.dynamic_rho_summary = {}
+    rho_trace = []
+    stress_trace = []
 
     # 早停相关变量 (原作者保留但实际未启用) / early-stopping bookkeeping
     # (kept from upstream; not actively used).
@@ -167,6 +247,18 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
             # 原型损失 / prototypical loss
             loss = criterion(embed, labels)
             loss.backward()
+            if dynamic_rho:
+                stress = float(_prototype_geometry_stress(embed.detach(), labels.detach()).item())
+                current_rho = _compute_dynamic_rho(
+                    rho,
+                    stress,
+                    dynamic_rho_alpha,
+                    dynamic_rho_min_ratio,
+                    dynamic_rho_max_ratio,
+                )
+                _set_sam_rho(optimizer, current_rho)
+                rho_trace.append(current_rho)
+                stress_trace.append(stress)
             optimizer.first_step(zero_grad=True)
 
             # ---------- SAM 第二次 forward-backward / second SAM step ----------
@@ -197,9 +289,30 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
             all_labels = torch.cat(all_labels)
             train_centroids = criterion._compute_class_centroid(all_labels, all_embeddings)
 
-        print("Epoch:", epoch + 1, "-->", running_loss, loss.item(), tmp.item())
+        should_log_epoch = (
+            log_every > 0
+            and (
+                epoch == 0
+                or epoch == nEpoch - 1
+                or (epoch + 1) % log_every == 0
+            )
+        )
+        if should_log_epoch:
+            epoch_msg = f"Epoch: {epoch + 1} --> {running_loss} {loss.item()} {tmp.item()}"
+            if dynamic_rho and rho_trace:
+                epoch_msg += f" rho={rho_trace[-1]:.6f} proto_stress={stress_trace[-1]:.6f}"
+            print(epoch_msg)
 
     print('Finished Training')
+    if dynamic_rho and rho_trace:
+        args.dynamic_rho_summary = {
+            "rho_min": float(np.min(rho_trace)),
+            "rho_mean": float(np.mean(rho_trace)),
+            "rho_max": float(np.max(rho_trace)),
+            "rho_final": float(rho_trace[-1]),
+            "proto_stress_mean": float(np.mean(stress_trace)),
+            "proto_stress_final": float(stress_trace[-1]),
+        }
 
     # 保存训练集原型, 后续推理 / 复现都依赖它
     # Persist the training centroids; both inference and reproduction rely on them.
