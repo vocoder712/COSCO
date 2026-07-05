@@ -26,6 +26,7 @@ from Baselines.TapNet import train_tapnet
 from utils.load_data import Dataset, load_data
 from utils.proto_model import (
     fft_regularized_proto_neg_train_model,
+    margin_fft_regularized_proto_neg_train_model,
     margin_proto_neg_train_model,
     proto_neg_train_model,
     weighted_proto_neg_train_model,
@@ -42,6 +43,7 @@ MODEL_CHOICES = [
     "cosco_dynamic_rho",
     "cosco_fft_reg",
     "cosco_proto_margin",
+    "cosco_proto_margin_fft_reg",
 ]
 
 
@@ -325,6 +327,25 @@ def run_cosco_proto_margin(train_data: np.ndarray, train_label: np.ndarray,
     ))
 
 
+def run_cosco_proto_margin_fft_reg(train_data: np.ndarray, train_label: np.ndarray,
+                                   test_data: np.ndarray, test_label: np.ndarray,
+                                   input_size: int, args: Namespace) -> float:
+    trainloader = DataLoader(
+        Dataset(train_data, train_label),
+        batch_size=1024,
+        shuffle=True,
+        num_workers=0,
+    )
+    return float(margin_fft_regularized_proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+    ))
+
+
 def run_single(run_args: Namespace) -> float:
     train_data, train_label, test_data, test_label = load_data(run_args)
     input_size = train_data.shape[-1]
@@ -354,6 +375,9 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_proto_margin":
         return run_cosco_proto_margin(train_data, train_label, test_data, test_label,
                                       input_size, run_args)
+    if run_args.model == "cosco_proto_margin_fft_reg":
+        return run_cosco_proto_margin_fft_reg(train_data, train_label, test_data,
+                                              test_label, input_size, run_args)
     raise ValueError(f"Unknown model: {run_args.model}")
 
 
@@ -407,7 +431,7 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
 
     fft_effect_rows = pd.DataFrame()
     fft_lambda_summary = pd.DataFrame()
-    fft_reg_models = ["cosco_fft_reg"]
+    fft_reg_models = ["cosco_fft_reg", "cosco_proto_margin_fft_reg"]
     if {"model", "fft_reg_lambda"}.issubset(df.columns):
         cosco_rows = df.loc[
             df["model"] == "cosco",
@@ -471,8 +495,9 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
             ["dataset", "shot", "accuracy"],
         ].rename(columns={"accuracy": "cosco"})
         margin_rows = df.loc[
-            df["model"] == "cosco_proto_margin",
+            df["model"].isin(["cosco_proto_margin", "cosco_proto_margin_fft_reg"]),
             [
+                "model",
                 "dataset",
                 "shot",
                 "accuracy",
@@ -506,7 +531,7 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
                 return int((delta < -1e-12).sum())
 
             proto_margin_summary = proto_margin_effect_rows.groupby(
-                ["proto_margin_value", "proto_margin_beta"]
+                ["model", "proto_margin_value", "proto_margin_beta"]
             ).agg(
                 cosco_mean=("cosco", "mean"),
                 cosco_proto_margin_mean=("cosco_proto_margin", "mean"),
@@ -606,7 +631,8 @@ def main() -> None:
                         default=["SpokenArabicDigits", "RacketSports", "Heartbeat", "JapaneseVowels", "Libras"],)
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 10],
                         choices=[1, 10])
-    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_proto_margin"],
+    parser.add_argument("--models", nargs="+",
+                        default=["cosco", "cosco_proto_margin"],
                         choices=MODEL_CHOICES)
     parser.add_argument("--nEpoch", type=int, default=100,
                         help="Epochs for TapNet, supervised ResNet, and COSCO.")
@@ -631,13 +657,13 @@ def main() -> None:
     parser.add_argument("--dynamic_rho_max_ratio", type=float, default=1.15,
                         help="Maximum dynamic rho as a ratio of --rho.")
     parser.add_argument("--fft_reg_lambdas", nargs="+", type=float,
-                        default=[0.1, 0.3, 0.5],
+                        default=[0.1],
                         help="Auxiliary FFT prototypical-loss weights for cosco_fft_reg.")
     parser.add_argument("--proto_margin_values", nargs="+", type=float,
-                        default=[0.0, 0.1, 0.3],
+                        default=[0.0],
                         help="Minimum correct-vs-nearest-wrong prototype distance gaps.")
     parser.add_argument("--proto_margin_betas", nargs="+", type=float,
-                        default=[0.05, 0.1, 0.3],
+                        default=[0.05],
                         help="Weights for the auxiliary prototype margin loss.")
     parser.add_argument("--log_every", type=int, default=1,
                         help="Print COSCO epoch logs every N epochs; 0 disables epoch logs.")
@@ -656,8 +682,8 @@ def main() -> None:
     for dataset in args.datasets:
         for shot in args.shots:
             for model in args.models:
-                is_fft_reg_model = model == "cosco_fft_reg"
-                is_proto_margin_model = model == "cosco_proto_margin"
+                is_fft_reg_model = model in {"cosco_fft_reg", "cosco_proto_margin_fft_reg"}
+                is_proto_margin_model = model in {"cosco_proto_margin", "cosco_proto_margin_fft_reg"}
                 lambda_values = args.fft_reg_lambdas if is_fft_reg_model else [np.nan]
                 margin_values = args.proto_margin_values if is_proto_margin_model else [np.nan]
                 beta_values = args.proto_margin_betas if is_proto_margin_model else [np.nan]

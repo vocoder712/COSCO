@@ -578,6 +578,168 @@ def fft_regularized_proto_neg_train_model(trainloader, train_label, test_data, t
     return acc
 
 
+def margin_fft_regularized_proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
+    """
+    COSCO variant combining the best prototype-margin loss with FFT regularization.
+
+    Time-domain training uses MarginPrototypicalLoss, frequency-domain training
+    uses the ordinary PrototypicalLoss as an auxiliary regularizer, and
+    inference remains time-domain nearest-centroid classification.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_resnet = ResNet(input_size=input_size, nb_classes=len(np.unique(train_label)))
+
+    lr = args.lr
+    rho = args.rho
+    nEpoch = args.nEpoch
+    log_every = int(getattr(args, 'log_every', 1))
+    fft_reg_lambda = float(getattr(args, 'fft_reg_lambda', 0.1))
+    proto_margin_value = float(getattr(args, 'proto_margin_value', 0.0))
+    proto_margin_beta = float(getattr(args, 'proto_margin_beta', 0.05))
+    if fft_reg_lambda < 0:
+        raise ValueError(f"fft_reg_lambda must be non-negative, got {fft_reg_lambda}")
+
+    time_criterion = MarginPrototypicalLoss(
+        flag='neg',
+        margin=proto_margin_value,
+        beta=proto_margin_beta,
+    )
+    freq_criterion = PrototypicalLoss(flag='neg')
+    runSAM = args.sam
+    if runSAM is False:
+        optimizer = torch.optim.SGD(model_resnet.parameters(), lr=lr, momentum=0.9)
+    else:
+        base_optimizer = torch.optim.SGD
+        optimizer = SAM(model_resnet.parameters(), base_optimizer,
+                        lr=lr, momentum=0.9, rho=rho)
+
+    model_resnet = model_resnet.to(device)
+    time_loss_trace = []
+    freq_loss_trace = []
+    total_loss_trace = []
+    lambda_trace = []
+    margin_base_loss_trace = []
+    margin_loss_trace = []
+    margin_total_loss_trace = []
+    margin_positive_rate_trace = []
+    margin_gap_trace = []
+    args.fft_reg_summary = {}
+    args.proto_margin_summary = {}
+
+    for epoch in range(nEpoch):
+        running_loss = 0.0
+        all_embeddings = []
+        all_labels = []
+
+        for i, data in enumerate(trainloader, 0):
+            inputs, labels = data
+            inputs = inputs.to(device).float()
+            labels = labels.to(device)
+            labels = torch.squeeze(labels, dim=1)
+            fft_inputs = fft_logmag_zscore_batch(inputs)
+
+            enable_running_stats(model_resnet)
+            optimizer.zero_grad()
+
+            time_embed = model_resnet(inputs.transpose(1, 2))[1]
+            time_loss = time_criterion(time_embed, labels)
+            margin_base_loss_trace.append(float(time_criterion.last_base_loss))
+            margin_loss_trace.append(float(time_criterion.last_margin_loss))
+            margin_total_loss_trace.append(float(time_criterion.last_total_loss))
+            margin_positive_rate_trace.append(float(time_criterion.last_positive_rate))
+            margin_gap_trace.append(float(time_criterion.last_mean_margin_gap))
+
+            disable_running_stats(model_resnet)
+            freq_embed = model_resnet(fft_inputs.transpose(1, 2).float())[1]
+            freq_loss = freq_criterion(freq_embed, labels)
+
+            total_loss = time_loss + fft_reg_lambda * freq_loss
+            total_loss.backward()
+
+            if runSAM is False:
+                optimizer.step()
+                tmp = total_loss.detach()
+            else:
+                optimizer.first_step(zero_grad=True)
+
+                disable_running_stats(model_resnet)
+                perturbed_time_embed = model_resnet(inputs.transpose(1, 2).float())[1]
+                perturbed_freq_embed = model_resnet(fft_inputs.transpose(1, 2).float())[1]
+                perturbed_time_loss = time_criterion(perturbed_time_embed, labels)
+                perturbed_freq_loss = freq_criterion(perturbed_freq_embed, labels)
+                tmp = perturbed_time_loss + fft_reg_lambda * perturbed_freq_loss
+                tmp.backward()
+                optimizer.second_step(zero_grad=True)
+
+            optimizer.zero_grad()
+
+            running_loss += total_loss.item()
+            time_loss_trace.append(float(time_loss.detach().item()))
+            freq_loss_trace.append(float(freq_loss.detach().item()))
+            total_loss_trace.append(float(total_loss.detach().item()))
+            lambda_trace.append(float(fft_reg_lambda))
+
+            if epoch == nEpoch - 1:
+                all_embeddings.append(time_embed.detach().cpu())
+                all_labels.append(labels.detach().cpu())
+
+        if epoch == nEpoch - 1:
+            all_embeddings = torch.cat(all_embeddings)
+            print(all_embeddings.size())
+            all_labels = torch.cat(all_labels)
+            train_centroids = time_criterion._compute_class_centroid(all_labels, all_embeddings)
+
+        should_log_epoch = (
+            log_every > 0
+            and (
+                epoch == 0
+                or epoch == nEpoch - 1
+                or (epoch + 1) % log_every == 0
+            )
+        )
+        if should_log_epoch:
+            print(
+                f"Epoch: {epoch + 1} --> {running_loss} "
+                f"time_margin={time_loss.item()} freq={freq_loss.item()} total2={tmp.item()} "
+                f"fft_lambda={fft_reg_lambda} margin={proto_margin_value} beta={proto_margin_beta}"
+            )
+
+    print('Finished Training')
+    if total_loss_trace:
+        args.fft_reg_summary = {
+            "fft_reg_loss_time_mean": float(np.mean(time_loss_trace)),
+            "fft_reg_loss_freq_mean": float(np.mean(freq_loss_trace)),
+            "fft_reg_loss_total_mean": float(np.mean(total_loss_trace)),
+            "fft_reg_lambda_min": float(np.min(lambda_trace)),
+            "fft_reg_lambda_mean": float(np.mean(lambda_trace)),
+            "fft_reg_lambda_max": float(np.max(lambda_trace)),
+            "fft_reg_lambda_final": float(lambda_trace[-1]),
+        }
+        args.proto_margin_summary = {
+            "proto_margin_base_loss_mean": float(np.mean(margin_base_loss_trace)),
+            "proto_margin_loss_mean": float(np.mean(margin_loss_trace)),
+            "proto_margin_total_loss_mean": float(np.mean(margin_total_loss_trace)),
+            "proto_margin_positive_rate_mean": float(np.mean(margin_positive_rate_trace)),
+            "proto_margin_gap_mean": float(np.mean(margin_gap_trace)),
+        }
+
+    centroid_path = 'train_centroids_margin_fft_reg.pt'
+    torch.save(train_centroids, centroid_path)
+
+    test_data = torch.from_numpy(test_data).float().to(device)
+    pred, embed = model_resnet(test_data.transpose(1, 2).float())
+    train_centroids = torch.load(centroid_path)
+    predicted_test_labels = ptest(embed, train_centroids)
+
+    labels = torch.squeeze(torch.from_numpy(test_label), dim=1)
+    total = labels.size(0)
+    correct = (predicted_test_labels.to(device) == labels.to(device)).sum().item()
+    acc = correct / total
+
+    print("Final Accuracy: ", acc)
+    return acc
+
+
 def full_training(args):
     """
     入口函数: 加载数据 -> 训练所选模型 -> 评估 -> 保存结果.
