@@ -1,0 +1,3 @@
+model,model_key,dataset,shot,accuracy,elapsed_sec,seed,status,cosco_variant,rho_min,rho_mean,rho_max,rho_final,proto_stress_mean,proto_stress_final,fft_reg_lambda,fft_reg_loss_time_mean,fft_reg_loss_freq_mean,fft_reg_loss_total_mean
+cosco,cosco,BasicMotions,1,1.0,1.0,9782,ok,,,,,,,,,,,
+cosco_fft_reg,cosco_fft_reg_l0.3,BasicMotions,1,1.0,0.4,9782,ok,fft_reg_lambda=0.3,,,,,,,0.3,0.7963260114192963,0.9544249475002289,1.082653522491455

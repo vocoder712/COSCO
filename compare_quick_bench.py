@@ -24,7 +24,11 @@ from torch.utils.data import DataLoader
 from Baselines.ResNet import ResNet
 from Baselines.TapNet import train_tapnet
 from utils.load_data import Dataset, load_data
-from utils.proto_model import proto_neg_train_model, weighted_proto_neg_train_model
+from utils.proto_model import (
+    fft_regularized_proto_neg_train_model,
+    proto_neg_train_model,
+    weighted_proto_neg_train_model,
+)
 
 
 MODEL_CHOICES = [
@@ -35,6 +39,7 @@ MODEL_CHOICES = [
     "cosco",
     "cosco_weighted",
     "cosco_dynamic_rho",
+    "cosco_fft_reg",
 ]
 
 
@@ -64,7 +69,7 @@ def stable_run_seed(base_seed: int, dataset: str, shot: int) -> int:
 
 
 def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
-                  model: str) -> Namespace:
+                  model: str, fft_reg_lambda: float = np.nan) -> Namespace:
     return Namespace(
         lr=args.lr,
         rho=args.rho,
@@ -89,11 +94,17 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         dynamic_rho_summary={},
         log_every=args.log_every,
         seed=args.seed,
+        fft_reg_lambda=fft_reg_lambda,
+        fft_reg_summary={},
     )
 
 
 def flatten_labels(y: np.ndarray) -> np.ndarray:
     return y.reshape(-1)
+
+
+def fft_lambda_key(value: float) -> str:
+    return f"{float(value):g}"
 
 
 def run_ed_1nn(train_data: np.ndarray, train_label: np.ndarray,
@@ -265,6 +276,25 @@ def run_cosco_dynamic_rho(train_data: np.ndarray, train_label: np.ndarray,
     ))
 
 
+def run_cosco_fft_reg(train_data: np.ndarray, train_label: np.ndarray,
+                      test_data: np.ndarray, test_label: np.ndarray,
+                      input_size: int, args: Namespace) -> float:
+    trainloader = DataLoader(
+        Dataset(train_data, train_label),
+        batch_size=1024,
+        shuffle=True,
+        num_workers=0,
+    )
+    return float(fft_regularized_proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+    ))
+
+
 def run_single(run_args: Namespace) -> float:
     train_data, train_label, test_data, test_label = load_data(run_args)
     input_size = train_data.shape[-1]
@@ -288,7 +318,9 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_dynamic_rho":
         return run_cosco_dynamic_rho(train_data, train_label, test_data, test_label,
                                      input_size, run_args)
-
+    if run_args.model == "cosco_fft_reg":
+        return run_cosco_fft_reg(train_data, train_label, test_data, test_label,
+                                 input_size, run_args)
     raise ValueError(f"Unknown model: {run_args.model}")
 
 
@@ -298,9 +330,12 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
     summary_md = os.path.join(args.out_dir, "summary.md")
     df.to_csv(summary_csv, index=False)
 
-    pivot = df.pivot_table(
+    pivot_df = df.copy()
+    if "model_key" not in pivot_df.columns:
+        pivot_df["model_key"] = pivot_df["model"]
+    pivot = pivot_df.pivot_table(
         index=["dataset", "shot"],
-        columns="model",
+        columns="model_key",
         values="accuracy",
         aggfunc="first",
     )
@@ -337,6 +372,64 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         dynamic_effect_rows["rho_mean_ratio"] = dynamic_effect_rows["rho_mean"] / args.rho
         dynamic_effect_rows["rho_max_ratio"] = dynamic_effect_rows["rho_max"] / args.rho
 
+    fft_effect_rows = pd.DataFrame()
+    fft_lambda_summary = pd.DataFrame()
+    fft_reg_models = ["cosco_fft_reg"]
+    if {"model", "fft_reg_lambda"}.issubset(df.columns):
+        cosco_rows = df.loc[
+            df["model"] == "cosco",
+            ["dataset", "shot", "accuracy"],
+        ].rename(columns={"accuracy": "cosco"})
+        fft_rows = df.loc[
+            df["model"].isin(fft_reg_models),
+            [
+                "model",
+                "dataset",
+                "shot",
+                "accuracy",
+                "fft_reg_lambda",
+                "fft_reg_loss_time_mean",
+                "fft_reg_loss_freq_mean",
+                "fft_reg_loss_total_mean",
+                "fft_reg_lambda_min",
+                "fft_reg_lambda_mean",
+                "fft_reg_lambda_max",
+                "fft_reg_lambda_final",
+            ],
+        ].rename(columns={"accuracy": "cosco_fft_reg_accuracy"})
+        if not cosco_rows.empty and not fft_rows.empty:
+            fft_effect_rows = fft_rows.merge(cosco_rows, on=["dataset", "shot"], how="inner")
+            fft_effect_rows["fft_reg_minus_cosco"] = (
+                fft_effect_rows["cosco_fft_reg_accuracy"] - fft_effect_rows["cosco"]
+            )
+
+            def _wins(delta: pd.Series) -> int:
+                return int((delta > 1e-12).sum())
+
+            def _ties(delta: pd.Series) -> int:
+                return int((delta.abs() <= 1e-12).sum())
+
+            def _losses(delta: pd.Series) -> int:
+                return int((delta < -1e-12).sum())
+
+            fft_lambda_summary = fft_effect_rows.groupby(["model", "fft_reg_lambda"]).agg(
+                cosco_mean=("cosco", "mean"),
+                cosco_fft_reg_mean=("cosco_fft_reg_accuracy", "mean"),
+                mean_delta=("fft_reg_minus_cosco", "mean"),
+                wins=("fft_reg_minus_cosco", _wins),
+                ties=("fft_reg_minus_cosco", _ties),
+                losses=("fft_reg_minus_cosco", _losses),
+                loss_time_mean=("fft_reg_loss_time_mean", "mean"),
+                loss_freq_mean=("fft_reg_loss_freq_mean", "mean"),
+                loss_total_mean=("fft_reg_loss_total_mean", "mean"),
+                effective_lambda_mean=("fft_reg_lambda_mean", "mean"),
+                effective_lambda_min=("fft_reg_lambda_min", "min"),
+                effective_lambda_max=("fft_reg_lambda_max", "max"),
+            ).reset_index()
+            fft_lambda_summary["gate_pass_mean_delta"] = (
+                fft_lambda_summary["mean_delta"] >= 0.005
+            )
+
     with open(summary_md, "w", encoding="utf-8") as f:
         f.write("# Quick COSCO Benchmark\n\n")
         f.write(f"- torch: `{torch.__version__}` | device: `{device_str}`\n")
@@ -351,7 +444,14 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         f.write(f"- dynamic rho alpha: `{args.dynamic_rho_alpha}`\n")
         f.write(f"- dynamic rho min ratio: `{args.dynamic_rho_min_ratio}`\n")
         f.write(f"- dynamic rho max ratio: `{args.dynamic_rho_max_ratio}`\n\n")
+        f.write(f"- FFT regularization lambdas: `{', '.join(map(str, args.fft_reg_lambdas))}`\n\n")
         f.write(accuracy_view.to_markdown(floatfmt=".4f"))
+        if not fft_lambda_summary.empty:
+            f.write("\n\n## FFT regularization effect by lambda\n\n")
+            f.write(fft_lambda_summary.to_markdown(index=False, floatfmt=".6f"))
+        if not fft_effect_rows.empty:
+            f.write("\n\n## FFT regularization effect\n\n")
+            f.write(fft_effect_rows.to_markdown(index=False, floatfmt=".6f"))
         if not dynamic_effect_rows.empty:
             f.write("\n\n## Dynamic rho effect\n\n")
             f.write(dynamic_effect_rows.to_markdown(index=False, floatfmt=".6f"))
@@ -366,6 +466,12 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
     print(f"[saved] {summary_md}")
     print("\n=== Accuracy comparison ===")
     print(accuracy_view.to_string(float_format=lambda x: f"{x:.4f}"))
+    if not fft_lambda_summary.empty:
+        print("\n=== FFT regularization effect by lambda ===")
+        print(fft_lambda_summary.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}",
+        ))
     if not dynamic_effect_rows.empty:
         print("\n=== Dynamic rho effect ===")
         print(dynamic_effect_rows.to_string(
@@ -388,7 +494,7 @@ def main() -> None:
                         default=["SpokenArabicDigits", "RacketSports", "Heartbeat", "JapaneseVowels", "Libras"],)
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 10],
                         choices=[1, 10])
-    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_dynamic_rho"],
+    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_fft_reg"],
                         choices=MODEL_CHOICES)
     parser.add_argument("--nEpoch", type=int, default=100,
                         help="Epochs for TapNet, supervised ResNet, and COSCO.")
@@ -412,6 +518,9 @@ def main() -> None:
                         help="Minimum dynamic rho as a ratio of --rho.")
     parser.add_argument("--dynamic_rho_max_ratio", type=float, default=1.15,
                         help="Maximum dynamic rho as a ratio of --rho.")
+    parser.add_argument("--fft_reg_lambdas", nargs="+", type=float,
+                        default=[0.1, 0.3, 0.5],
+                        help="Auxiliary FFT prototypical-loss weights for cosco_fft_reg.")
     parser.add_argument("--log_every", type=int, default=1,
                         help="Print COSCO epoch logs every N epochs; 0 disables epoch logs.")
     args = parser.parse_args()
@@ -429,55 +538,86 @@ def main() -> None:
     for dataset in args.datasets:
         for shot in args.shots:
             for model in args.models:
-                tag = f"{model:<8} | {dataset:<14} | {shot}-shot"
-                print(f"\n[run] {tag}")
-                t0 = time.time()
-                run_seed = stable_run_seed(args.seed, dataset, shot)
-                set_seed(run_seed, deterministic_torch=args.deterministic_torch)
-                run_args = make_run_args(args, dataset, shot, model)
-                try:
-                    acc = run_single(run_args)
-                    status = "ok"
-                except Exception as exc:  # noqa: BLE001
-                    acc = float("nan")
-                    status = f"failed: {type(exc).__name__}: {exc}"
-                    print(f"[err] {tag}: {status}", file=sys.stderr)
+                is_fft_reg_model = model == "cosco_fft_reg"
+                lambda_values = args.fft_reg_lambdas if is_fft_reg_model else [np.nan]
+                for fft_reg_lambda in lambda_values:
+                    lambda_suffix = (
+                        f" | lambda={fft_lambda_key(fft_reg_lambda)}"
+                        if is_fft_reg_model
+                        else ""
+                    )
+                    tag = f"{model:<13} | {dataset:<14} | {shot}-shot{lambda_suffix}"
+                    print(f"\n[run] {tag}")
+                    t0 = time.time()
+                    run_seed = stable_run_seed(args.seed, dataset, shot)
+                    set_seed(run_seed, deterministic_torch=args.deterministic_torch)
+                    run_args = make_run_args(args, dataset, shot, model, fft_reg_lambda)
+                    try:
+                        acc = run_single(run_args)
+                        status = "ok"
+                    except Exception as exc:  # noqa: BLE001
+                        acc = float("nan")
+                        status = f"failed: {type(exc).__name__}: {exc}"
+                        print(f"[err] {tag}: {status}", file=sys.stderr)
 
-                elapsed = round(time.time() - t0, 1)
-                dynamic_summary = getattr(run_args, "dynamic_rho_summary", {}) or {}
-                rows.append({
-                    "model": model,
-                    "dataset": dataset,
-                    "shot": shot,
-                    "accuracy": acc,
-                    "elapsed_sec": elapsed,
-                    "seed": run_seed,
-                    "status": status,
-                    "cosco_variant": (
-                        "dummy_noop"
-                        if model == "cosco" and args.dummy_cosco_improvement
-                        else (
-                            f"weighted_{args.weighted_proto_mode}_gamma={args.weighted_proto_gamma}"
-                            if model == "cosco_weighted"
+                    elapsed = round(time.time() - t0, 1)
+                    dynamic_summary = getattr(run_args, "dynamic_rho_summary", {}) or {}
+                    fft_summary = getattr(run_args, "fft_reg_summary", {}) or {}
+                    model_key = (
+                        f"{model}_l{fft_lambda_key(fft_reg_lambda)}"
+                        if is_fft_reg_model
+                        else model
+                    )
+                    rows.append({
+                        "model": model,
+                        "model_key": model_key,
+                        "dataset": dataset,
+                        "shot": shot,
+                        "accuracy": acc,
+                        "elapsed_sec": elapsed,
+                        "seed": run_seed,
+                        "status": status,
+                        "cosco_variant": (
+                            "dummy_noop"
+                            if model == "cosco" and args.dummy_cosco_improvement
                             else (
-                                f"dynamic_rho_proto_geometry_alpha={args.dynamic_rho_alpha}"
-                                if model == "cosco_dynamic_rho"
-                                else ""
+                                f"weighted_{args.weighted_proto_mode}_gamma={args.weighted_proto_gamma}"
+                                if model == "cosco_weighted"
+                                else (
+                                    f"dynamic_rho_proto_geometry_alpha={args.dynamic_rho_alpha}"
+                                    if model == "cosco_dynamic_rho"
+                                    else (
+                                        f"fft_reg_lambda={fft_lambda_key(fft_reg_lambda)}"
+                                        if is_fft_reg_model
+                                        else ""
+                                    )
+                                )
                             )
-                        )
-                    ),
-                    "rho_min": dynamic_summary.get("rho_min", np.nan),
-                    "rho_mean": dynamic_summary.get("rho_mean", np.nan),
-                    "rho_max": dynamic_summary.get("rho_max", np.nan),
-                    "rho_final": dynamic_summary.get("rho_final", np.nan),
-                    "proto_stress_mean": dynamic_summary.get("proto_stress_mean", np.nan),
-                    "proto_stress_final": dynamic_summary.get("proto_stress_final", np.nan),
-                })
-                print(f"[done] {tag} -> acc={acc:.4f} ({elapsed}s, {status})")
+                        ),
+                        "rho_min": dynamic_summary.get("rho_min", np.nan),
+                        "rho_mean": dynamic_summary.get("rho_mean", np.nan),
+                        "rho_max": dynamic_summary.get("rho_max", np.nan),
+                        "rho_final": dynamic_summary.get("rho_final", np.nan),
+                        "proto_stress_mean": dynamic_summary.get("proto_stress_mean", np.nan),
+                        "proto_stress_final": dynamic_summary.get("proto_stress_final", np.nan),
+                        "fft_reg_lambda": (
+                            float(fft_reg_lambda)
+                            if is_fft_reg_model
+                            else np.nan
+                        ),
+                        "fft_reg_loss_time_mean": fft_summary.get("fft_reg_loss_time_mean", np.nan),
+                        "fft_reg_loss_freq_mean": fft_summary.get("fft_reg_loss_freq_mean", np.nan),
+                        "fft_reg_loss_total_mean": fft_summary.get("fft_reg_loss_total_mean", np.nan),
+                        "fft_reg_lambda_min": fft_summary.get("fft_reg_lambda_min", np.nan),
+                        "fft_reg_lambda_mean": fft_summary.get("fft_reg_lambda_mean", np.nan),
+                        "fft_reg_lambda_max": fft_summary.get("fft_reg_lambda_max", np.nan),
+                        "fft_reg_lambda_final": fft_summary.get("fft_reg_lambda_final", np.nan),
+                    })
+                    print(f"[done] {tag} -> acc={acc:.4f} ({elapsed}s, {status})")
 
-                partial_df = pd.DataFrame(rows)
-                partial_df.to_csv(os.path.join(args.out_dir, "summary_partial.csv"),
-                                  index=False)
+                    partial_df = pd.DataFrame(rows)
+                    partial_df.to_csv(os.path.join(args.out_dir, "summary_partial.csv"),
+                                      index=False)
 
     write_outputs(pd.DataFrame(rows), args, device_str)
 

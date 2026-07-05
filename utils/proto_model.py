@@ -126,6 +126,24 @@ def _compute_dynamic_rho(base_rho, stress, alpha, min_ratio, max_ratio):
     return max(min(scaled_rho, max_rho), min_rho)
 
 
+def fft_logmag_zscore_batch(inputs, eps=1e-8):
+    """
+    Build a differentiable FFT log-magnitude view for a batch shaped (B, T, C).
+
+    The output keeps the channel dimension unchanged: (B, T//2 + 1, C).
+    Each sample/channel spectrum is z-scored over frequency bins so that
+    absolute spectral energy does not dominate the auxiliary prototypical loss.
+    """
+    spectrum = torch.fft.rfft(inputs.float(), dim=1)
+    logmag = torch.log1p(torch.abs(spectrum))
+    mean = logmag.mean(dim=1, keepdim=True)
+    std = logmag.std(dim=1, keepdim=True, unbiased=False)
+    zscored = (logmag - mean) / (std + eps)
+    if not torch.isfinite(zscored).all():
+        raise ValueError("FFT log-magnitude z-score produced non-finite values")
+    return zscored
+
+
 def proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args,
                           criterion_override=None, centroid_path='train_centroids.pt'):
     """
@@ -367,6 +385,150 @@ def weighted_proto_neg_train_model(trainloader, train_label, test_data, test_lab
         criterion_override=criterion,
         centroid_path='train_centroids_weighted.pt',
     )
+
+
+def fft_regularized_proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
+    """
+    仅将 FFT 视图用作训练正则化项。 
+
+    推理过程仍仅在时域进行：
+    最终的质心由时域嵌入计算得出，测试样本则基于这些质心进行分类。
+    在训练期间，频域视图引入了一个权重为 `args.fft_reg_lambda` 的辅助原型损失
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model_resnet = ResNet(input_size=input_size, nb_classes=len(np.unique(train_label)))
+
+    lr = args.lr
+    rho = args.rho
+    nEpoch = args.nEpoch
+    log_every = int(getattr(args, 'log_every', 1))
+    fft_reg_lambda = float(getattr(args, 'fft_reg_lambda', 0.3))
+    if fft_reg_lambda < 0:
+        raise ValueError(f"fft_reg_lambda 必须非负, got {fft_reg_lambda}")
+
+    criterion = PrototypicalLoss(flag='neg')
+    runSAM = args.sam
+    if runSAM is False:
+        optimizer = torch.optim.SGD(model_resnet.parameters(), lr=lr, momentum=0.9)
+    else:
+        base_optimizer = torch.optim.SGD
+        optimizer = SAM(model_resnet.parameters(), base_optimizer,
+                        lr=lr, momentum=0.9, rho=rho)
+
+    model_resnet = model_resnet.to(device)
+    time_loss_trace = []
+    freq_loss_trace = []
+    total_loss_trace = []
+    lambda_trace = []
+    args.fft_reg_summary = {}
+
+    for epoch in range(nEpoch):
+        running_loss = 0.0
+        all_embeddings = []
+        all_labels = []
+
+        for i, data in enumerate(trainloader, 0):
+            inputs, labels = data
+            inputs = inputs.to(device).float()
+            labels = labels.to(device)
+            labels = torch.squeeze(labels, dim=1)
+
+            fft_inputs = fft_logmag_zscore_batch(inputs)
+
+            enable_running_stats(model_resnet)
+            optimizer.zero_grad()
+
+            # Clean time-domain forward is the only pass allowed to update BN
+            # running statistics, because inference is time-domain only.
+            time_outputs = model_resnet(inputs.transpose(1, 2))
+            time_embed = time_outputs[1]
+            time_loss = criterion(time_embed, labels)
+
+            disable_running_stats(model_resnet)
+            freq_embed = model_resnet(fft_inputs.transpose(1, 2).float())[1]
+            freq_loss = criterion(freq_embed, labels)
+
+            current_fft_lambda = fft_reg_lambda
+            total_loss = time_loss + current_fft_lambda * freq_loss
+            total_loss.backward()
+
+            if runSAM is False:
+                optimizer.step()
+                tmp = total_loss.detach()
+            else:
+                optimizer.first_step(zero_grad=True)
+
+                # SAM perturbed pass: keep BN stats frozen for both views.
+                disable_running_stats(model_resnet)
+                perturbed_time_embed = model_resnet(inputs.transpose(1, 2).float())[1]
+                perturbed_freq_embed = model_resnet(fft_inputs.transpose(1, 2).float())[1]
+                perturbed_time_loss = criterion(perturbed_time_embed, labels)
+                perturbed_freq_loss = criterion(perturbed_freq_embed, labels)
+                tmp = perturbed_time_loss + current_fft_lambda * perturbed_freq_loss
+                tmp.backward()
+                optimizer.second_step(zero_grad=True)
+
+            optimizer.zero_grad()
+
+            running_loss += total_loss.item()
+            time_loss_trace.append(float(time_loss.detach().item()))
+            freq_loss_trace.append(float(freq_loss.detach().item()))
+            total_loss_trace.append(float(total_loss.detach().item()))
+            lambda_trace.append(float(current_fft_lambda))
+
+            if epoch == nEpoch - 1:
+                all_embeddings.append(time_embed.detach().cpu())
+                all_labels.append(labels.detach().cpu())
+
+        if epoch == nEpoch - 1:
+            all_embeddings = torch.cat(all_embeddings)
+            print(all_embeddings.size())
+            all_labels = torch.cat(all_labels)
+            train_centroids = criterion._compute_class_centroid(all_labels, all_embeddings)
+
+        should_log_epoch = (
+            log_every > 0
+            and (
+                epoch == 0
+                or epoch == nEpoch - 1
+                or (epoch + 1) % log_every == 0
+            )
+        )
+        # 日志
+        if should_log_epoch:
+            print(
+                f"Epoch: {epoch + 1} --> {running_loss} "
+                f"time={time_loss.item()} freq={freq_loss.item()} total2={tmp.item()} "
+                f"fft_lambda={current_fft_lambda}"
+            )
+
+    print('完成训练 / Finished Training')
+    if total_loss_trace:
+        args.fft_reg_summary = {
+            "fft_reg_loss_time_mean": float(np.mean(time_loss_trace)),
+            "fft_reg_loss_freq_mean": float(np.mean(freq_loss_trace)),
+            "fft_reg_loss_total_mean": float(np.mean(total_loss_trace)),
+            "fft_reg_lambda_min": float(np.min(lambda_trace)),
+            "fft_reg_lambda_mean": float(np.mean(lambda_trace)),
+            "fft_reg_lambda_max": float(np.max(lambda_trace)),
+            "fft_reg_lambda_final": float(lambda_trace[-1]),
+        }
+
+    centroid_path = 'train_centroids_fft_reg.pt'
+    torch.save(train_centroids, centroid_path)
+
+    test_data = torch.from_numpy(test_data).float().to(device)
+    pred, embed = model_resnet(test_data.transpose(1, 2).float())
+    train_centroids = torch.load(centroid_path)
+    predicted_test_labels = ptest(embed, train_centroids)
+
+    labels = torch.squeeze(torch.from_numpy(test_label), dim=1)
+    total = labels.size(0)
+    correct = (predicted_test_labels.to(device) == labels.to(device)).sum().item()
+    acc = correct / total
+
+    print("Final Accuracy: ", acc)
+    return acc
 
 
 def full_training(args):
