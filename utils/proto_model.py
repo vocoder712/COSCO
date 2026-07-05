@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from Prototypical_Loss import PrototypicalLoss, WeightedPrototypicalLoss
+from Prototypical_Loss import MarginPrototypicalLoss, PrototypicalLoss, WeightedPrototypicalLoss
 from Prototypical_Loss import prototypical_testing as ptest
 from Baselines.ResNet import *
 from Baselines.TapNet import train_tapnet  # 让 full_training 能在 tapnet 分支调用
@@ -227,8 +227,14 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     # 模型搬到目标设备 / move model to target device
     model_resnet = model_resnet.to(device)
     args.dynamic_rho_summary = {}
+    args.proto_margin_summary = {}
     rho_trace = []
     stress_trace = []
+    margin_base_loss_trace = []
+    margin_loss_trace = []
+    margin_total_loss_trace = []
+    margin_positive_rate_trace = []
+    margin_gap_trace = []
 
     # 早停相关变量 (原作者保留但实际未启用) / early-stopping bookkeeping
     # (kept from upstream; not actively used).
@@ -264,6 +270,12 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
 
             # 原型损失 / prototypical loss
             loss = criterion(embed, labels)
+            if hasattr(criterion, 'last_margin_loss') and criterion.last_margin_loss is not None:
+                margin_base_loss_trace.append(float(criterion.last_base_loss))
+                margin_loss_trace.append(float(criterion.last_margin_loss))
+                margin_total_loss_trace.append(float(criterion.last_total_loss))
+                margin_positive_rate_trace.append(float(criterion.last_positive_rate))
+                margin_gap_trace.append(float(criterion.last_mean_margin_gap))
             loss.backward()
             if dynamic_rho:
                 stress = float(_prototype_geometry_stress(embed.detach(), labels.detach()).item())
@@ -331,6 +343,14 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
             "proto_stress_mean": float(np.mean(stress_trace)),
             "proto_stress_final": float(stress_trace[-1]),
         }
+    if margin_loss_trace:
+        args.proto_margin_summary = {
+            "proto_margin_base_loss_mean": float(np.mean(margin_base_loss_trace)),
+            "proto_margin_loss_mean": float(np.mean(margin_loss_trace)),
+            "proto_margin_total_loss_mean": float(np.mean(margin_total_loss_trace)),
+            "proto_margin_positive_rate_mean": float(np.mean(margin_positive_rate_trace)),
+            "proto_margin_gap_mean": float(np.mean(margin_gap_trace)),
+        }
 
     # 保存训练集原型, 后续推理 / 复现都依赖它
     # Persist the training centroids; both inference and reproduction rely on them.
@@ -384,6 +404,33 @@ def weighted_proto_neg_train_model(trainloader, train_label, test_data, test_lab
         args,
         criterion_override=criterion,
         centroid_path='train_centroids_weighted.pt',
+    )
+
+
+def margin_proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
+    """
+    COSCO variant using an auxiliary nearest-wrong-prototype margin loss.
+
+    The inference path is unchanged: time-domain embeddings are classified by
+    nearest training centroid. The training objective adds a hinge term that
+    asks the correct prototype to be closer than the nearest wrong prototype.
+    """
+    margin = float(getattr(args, 'proto_margin_value', 0.1))
+    beta = float(getattr(args, 'proto_margin_beta', 0.1))
+    criterion = MarginPrototypicalLoss(
+        flag='neg',
+        margin=margin,
+        beta=beta,
+    )
+    return proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+        criterion_override=criterion,
+        centroid_path='train_centroids_margin.pt',
     )
 
 

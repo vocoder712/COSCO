@@ -180,6 +180,76 @@ class WeightedPrototypicalLoss(PrototypicalLoss):
         return weighted_centroid
 
 
+class MarginPrototypicalLoss(PrototypicalLoss):
+    """
+    Prototypical loss with an explicit nearest-wrong-prototype margin.
+
+    The auxiliary term is:
+        max(0, margin + d_own - d_nearest_wrong)
+
+    It directly matches the nearest-centroid inference rule: the correct class
+    prototype should be closer than the nearest wrong prototype by at least
+    `margin`.
+    """
+
+    def __init__(self, flag='neg', margin=0.1, beta=0.1):
+        super().__init__(flag=flag)
+        if margin < 0:
+            raise ValueError(f"margin must be non-negative, got {margin}")
+        if beta < 0:
+            raise ValueError(f"beta must be non-negative, got {beta}")
+        self.margin = margin
+        self.beta = beta
+        self.last_base_loss = None
+        self.last_margin_loss = None
+        self.last_total_loss = None
+        self.last_positive_rate = None
+        self.last_mean_margin_gap = None
+
+    def _label_indices(self, labels, unique_labels):
+        labels = labels.squeeze().long()
+        target_indices = torch.empty_like(labels)
+        for class_index, class_label in enumerate(unique_labels):
+            target_indices[labels == class_label] = class_index
+        return target_indices
+
+    def _margin_loss(self, distances, labels, unique_labels):
+        labels = labels.squeeze().long()
+        if unique_labels.numel() < 2:
+            self.last_positive_rate = 0.0
+            self.last_mean_margin_gap = 0.0
+            return distances.new_tensor(0.0)
+
+        target_indices = self._label_indices(labels, unique_labels)
+        own_dist = distances.gather(1, target_indices.view(-1, 1)).squeeze(1)
+        other_distances = distances.clone()
+        other_distances.scatter_(1, target_indices.view(-1, 1), float("inf"))
+        nearest_wrong = other_distances.min(dim=1).values
+        raw_gap = nearest_wrong - own_dist
+        violations = torch.relu(self.margin - raw_gap)
+
+        with torch.no_grad():
+            active = violations > 0
+            self.last_positive_rate = float(active.float().mean().item())
+            self.last_mean_margin_gap = float(raw_gap.mean().item())
+        return violations.mean()
+
+    def __call__(self, data, label):
+        if self.flag != 'neg':
+            raise ValueError("MarginPrototypicalLoss currently supports only flag='neg'")
+        unique_labels = label.unique().squeeze()
+        centroids = self._compute_class_centroid(label, data)
+        distances = self._distance_matrix(data, centroids)
+        base_loss = self._prototypical_loss_neg(distances, label)
+        margin_loss = self._margin_loss(distances, label, unique_labels)
+        total_loss = base_loss + self.beta * margin_loss
+
+        self.last_base_loss = float(base_loss.detach().item())
+        self.last_margin_loss = float(margin_loss.detach().item())
+        self.last_total_loss = float(total_loss.detach().item())
+        return total_loss
+
+
 def prototypical_testing(test_embed, train_centroids):
     """
     最近原型分类 / nearest-centroid classification at inference time.

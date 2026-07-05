@@ -26,6 +26,7 @@ from Baselines.TapNet import train_tapnet
 from utils.load_data import Dataset, load_data
 from utils.proto_model import (
     fft_regularized_proto_neg_train_model,
+    margin_proto_neg_train_model,
     proto_neg_train_model,
     weighted_proto_neg_train_model,
 )
@@ -40,6 +41,7 @@ MODEL_CHOICES = [
     "cosco_weighted",
     "cosco_dynamic_rho",
     "cosco_fft_reg",
+    "cosco_proto_margin",
 ]
 
 
@@ -69,7 +71,9 @@ def stable_run_seed(base_seed: int, dataset: str, shot: int) -> int:
 
 
 def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
-                  model: str, fft_reg_lambda: float = np.nan) -> Namespace:
+                  model: str, fft_reg_lambda: float = np.nan,
+                  proto_margin_value: float = np.nan,
+                  proto_margin_beta: float = np.nan) -> Namespace:
     return Namespace(
         lr=args.lr,
         rho=args.rho,
@@ -96,6 +100,9 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         seed=args.seed,
         fft_reg_lambda=fft_reg_lambda,
         fft_reg_summary={},
+        proto_margin_value=proto_margin_value,
+        proto_margin_beta=proto_margin_beta,
+        proto_margin_summary={},
     )
 
 
@@ -105,6 +112,10 @@ def flatten_labels(y: np.ndarray) -> np.ndarray:
 
 def fft_lambda_key(value: float) -> str:
     return f"{float(value):g}"
+
+
+def proto_margin_key(margin: float, beta: float) -> str:
+    return f"m{float(margin):g}_b{float(beta):g}"
 
 
 def run_ed_1nn(train_data: np.ndarray, train_label: np.ndarray,
@@ -295,6 +306,25 @@ def run_cosco_fft_reg(train_data: np.ndarray, train_label: np.ndarray,
     ))
 
 
+def run_cosco_proto_margin(train_data: np.ndarray, train_label: np.ndarray,
+                           test_data: np.ndarray, test_label: np.ndarray,
+                           input_size: int, args: Namespace) -> float:
+    trainloader = DataLoader(
+        Dataset(train_data, train_label),
+        batch_size=1024,
+        shuffle=True,
+        num_workers=0,
+    )
+    return float(margin_proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+    ))
+
+
 def run_single(run_args: Namespace) -> float:
     train_data, train_label, test_data, test_label = load_data(run_args)
     input_size = train_data.shape[-1]
@@ -321,6 +351,9 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_fft_reg":
         return run_cosco_fft_reg(train_data, train_label, test_data, test_label,
                                  input_size, run_args)
+    if run_args.model == "cosco_proto_margin":
+        return run_cosco_proto_margin(train_data, train_label, test_data, test_label,
+                                      input_size, run_args)
     raise ValueError(f"Unknown model: {run_args.model}")
 
 
@@ -430,6 +463,71 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
                 fft_lambda_summary["mean_delta"] >= 0.005
             )
 
+    proto_margin_effect_rows = pd.DataFrame()
+    proto_margin_summary = pd.DataFrame()
+    if {"model", "proto_margin_value", "proto_margin_beta"}.issubset(df.columns):
+        cosco_rows = df.loc[
+            df["model"] == "cosco",
+            ["dataset", "shot", "accuracy"],
+        ].rename(columns={"accuracy": "cosco"})
+        margin_rows = df.loc[
+            df["model"] == "cosco_proto_margin",
+            [
+                "dataset",
+                "shot",
+                "accuracy",
+                "proto_margin_value",
+                "proto_margin_beta",
+                "proto_margin_base_loss_mean",
+                "proto_margin_loss_mean",
+                "proto_margin_total_loss_mean",
+                "proto_margin_positive_rate_mean",
+                "proto_margin_gap_mean",
+            ],
+        ].rename(columns={"accuracy": "cosco_proto_margin"})
+        if not cosco_rows.empty and not margin_rows.empty:
+            proto_margin_effect_rows = margin_rows.merge(
+                cosco_rows,
+                on=["dataset", "shot"],
+                how="inner",
+            )
+            proto_margin_effect_rows["proto_margin_minus_cosco"] = (
+                proto_margin_effect_rows["cosco_proto_margin"]
+                - proto_margin_effect_rows["cosco"]
+            )
+
+            def _wins(delta: pd.Series) -> int:
+                return int((delta > 1e-12).sum())
+
+            def _ties(delta: pd.Series) -> int:
+                return int((delta.abs() <= 1e-12).sum())
+
+            def _losses(delta: pd.Series) -> int:
+                return int((delta < -1e-12).sum())
+
+            proto_margin_summary = proto_margin_effect_rows.groupby(
+                ["proto_margin_value", "proto_margin_beta"]
+            ).agg(
+                cosco_mean=("cosco", "mean"),
+                cosco_proto_margin_mean=("cosco_proto_margin", "mean"),
+                mean_delta=("proto_margin_minus_cosco", "mean"),
+                wins=("proto_margin_minus_cosco", _wins),
+                ties=("proto_margin_minus_cosco", _ties),
+                losses=("proto_margin_minus_cosco", _losses),
+                base_loss_mean=("proto_margin_base_loss_mean", "mean"),
+                margin_loss_mean=("proto_margin_loss_mean", "mean"),
+                total_loss_mean=("proto_margin_total_loss_mean", "mean"),
+                positive_rate_mean=("proto_margin_positive_rate_mean", "mean"),
+                gap_mean=("proto_margin_gap_mean", "mean"),
+            ).reset_index()
+            proto_margin_summary["gate_pass_mean_delta"] = (
+                proto_margin_summary["mean_delta"] >= 0.005
+            )
+            proto_margin_summary = proto_margin_summary.sort_values(
+                ["mean_delta", "wins"],
+                ascending=[False, False],
+            )
+
     with open(summary_md, "w", encoding="utf-8") as f:
         f.write("# Quick COSCO Benchmark\n\n")
         f.write(f"- torch: `{torch.__version__}` | device: `{device_str}`\n")
@@ -445,7 +543,15 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
         f.write(f"- dynamic rho min ratio: `{args.dynamic_rho_min_ratio}`\n")
         f.write(f"- dynamic rho max ratio: `{args.dynamic_rho_max_ratio}`\n\n")
         f.write(f"- FFT regularization lambdas: `{', '.join(map(str, args.fft_reg_lambdas))}`\n\n")
+        f.write(f"- prototype margin values: `{', '.join(map(str, args.proto_margin_values))}`\n")
+        f.write(f"- prototype margin betas: `{', '.join(map(str, args.proto_margin_betas))}`\n\n")
         f.write(accuracy_view.to_markdown(floatfmt=".4f"))
+        if not proto_margin_summary.empty:
+            f.write("\n\n## Prototype margin effect by hyperparameter\n\n")
+            f.write(proto_margin_summary.to_markdown(index=False, floatfmt=".6f"))
+        if not proto_margin_effect_rows.empty:
+            f.write("\n\n## Prototype margin effect\n\n")
+            f.write(proto_margin_effect_rows.to_markdown(index=False, floatfmt=".6f"))
         if not fft_lambda_summary.empty:
             f.write("\n\n## FFT regularization effect by lambda\n\n")
             f.write(fft_lambda_summary.to_markdown(index=False, floatfmt=".6f"))
@@ -472,6 +578,12 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
             index=False,
             float_format=lambda x: f"{x:.6f}",
         ))
+    if not proto_margin_summary.empty:
+        print("\n=== Prototype margin effect by hyperparameter ===")
+        print(proto_margin_summary.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}",
+        ))
     if not dynamic_effect_rows.empty:
         print("\n=== Dynamic rho effect ===")
         print(dynamic_effect_rows.to_string(
@@ -494,7 +606,7 @@ def main() -> None:
                         default=["SpokenArabicDigits", "RacketSports", "Heartbeat", "JapaneseVowels", "Libras"],)
     parser.add_argument("--shots", nargs="+", type=int, default=[1, 10],
                         choices=[1, 10])
-    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_fft_reg"],
+    parser.add_argument("--models", nargs="+", default=["cosco", "cosco_proto_margin"],
                         choices=MODEL_CHOICES)
     parser.add_argument("--nEpoch", type=int, default=100,
                         help="Epochs for TapNet, supervised ResNet, and COSCO.")
@@ -521,6 +633,12 @@ def main() -> None:
     parser.add_argument("--fft_reg_lambdas", nargs="+", type=float,
                         default=[0.1, 0.3, 0.5],
                         help="Auxiliary FFT prototypical-loss weights for cosco_fft_reg.")
+    parser.add_argument("--proto_margin_values", nargs="+", type=float,
+                        default=[0.0, 0.1, 0.3],
+                        help="Minimum correct-vs-nearest-wrong prototype distance gaps.")
+    parser.add_argument("--proto_margin_betas", nargs="+", type=float,
+                        default=[0.05, 0.1, 0.3],
+                        help="Weights for the auxiliary prototype margin loss.")
     parser.add_argument("--log_every", type=int, default=1,
                         help="Print COSCO epoch logs every N epochs; 0 disables epoch logs.")
     args = parser.parse_args()
@@ -539,19 +657,41 @@ def main() -> None:
         for shot in args.shots:
             for model in args.models:
                 is_fft_reg_model = model == "cosco_fft_reg"
+                is_proto_margin_model = model == "cosco_proto_margin"
                 lambda_values = args.fft_reg_lambdas if is_fft_reg_model else [np.nan]
-                for fft_reg_lambda in lambda_values:
+                margin_values = args.proto_margin_values if is_proto_margin_model else [np.nan]
+                beta_values = args.proto_margin_betas if is_proto_margin_model else [np.nan]
+                run_specs = [
+                    (fft_reg_lambda, proto_margin_value, proto_margin_beta)
+                    for fft_reg_lambda in lambda_values
+                    for proto_margin_value in margin_values
+                    for proto_margin_beta in beta_values
+                ]
+                for fft_reg_lambda, proto_margin_value, proto_margin_beta in run_specs:
                     lambda_suffix = (
                         f" | lambda={fft_lambda_key(fft_reg_lambda)}"
                         if is_fft_reg_model
                         else ""
                     )
-                    tag = f"{model:<13} | {dataset:<14} | {shot}-shot{lambda_suffix}"
+                    margin_suffix = (
+                        f" | {proto_margin_key(proto_margin_value, proto_margin_beta)}"
+                        if is_proto_margin_model
+                        else ""
+                    )
+                    tag = f"{model:<18} | {dataset:<14} | {shot}-shot{lambda_suffix}{margin_suffix}"
                     print(f"\n[run] {tag}")
                     t0 = time.time()
                     run_seed = stable_run_seed(args.seed, dataset, shot)
                     set_seed(run_seed, deterministic_torch=args.deterministic_torch)
-                    run_args = make_run_args(args, dataset, shot, model, fft_reg_lambda)
+                    run_args = make_run_args(
+                        args,
+                        dataset,
+                        shot,
+                        model,
+                        fft_reg_lambda,
+                        proto_margin_value,
+                        proto_margin_beta,
+                    )
                     try:
                         acc = run_single(run_args)
                         status = "ok"
@@ -566,7 +706,11 @@ def main() -> None:
                     model_key = (
                         f"{model}_l{fft_lambda_key(fft_reg_lambda)}"
                         if is_fft_reg_model
-                        else model
+                        else (
+                            f"{model}_{proto_margin_key(proto_margin_value, proto_margin_beta)}"
+                            if is_proto_margin_model
+                            else model
+                        )
                     )
                     rows.append({
                         "model": model,
@@ -589,7 +733,11 @@ def main() -> None:
                                     else (
                                         f"fft_reg_lambda={fft_lambda_key(fft_reg_lambda)}"
                                         if is_fft_reg_model
-                                        else ""
+                                        else (
+                                            proto_margin_key(proto_margin_value, proto_margin_beta)
+                                            if is_proto_margin_model
+                                            else ""
+                                        )
                                     )
                                 )
                             )
@@ -612,6 +760,31 @@ def main() -> None:
                         "fft_reg_lambda_mean": fft_summary.get("fft_reg_lambda_mean", np.nan),
                         "fft_reg_lambda_max": fft_summary.get("fft_reg_lambda_max", np.nan),
                         "fft_reg_lambda_final": fft_summary.get("fft_reg_lambda_final", np.nan),
+                        "proto_margin_value": (
+                            float(proto_margin_value)
+                            if is_proto_margin_model
+                            else np.nan
+                        ),
+                        "proto_margin_beta": (
+                            float(proto_margin_beta)
+                            if is_proto_margin_model
+                            else np.nan
+                        ),
+                        "proto_margin_base_loss_mean": getattr(
+                            run_args, "proto_margin_summary", {}
+                        ).get("proto_margin_base_loss_mean", np.nan),
+                        "proto_margin_loss_mean": getattr(
+                            run_args, "proto_margin_summary", {}
+                        ).get("proto_margin_loss_mean", np.nan),
+                        "proto_margin_total_loss_mean": getattr(
+                            run_args, "proto_margin_summary", {}
+                        ).get("proto_margin_total_loss_mean", np.nan),
+                        "proto_margin_positive_rate_mean": getattr(
+                            run_args, "proto_margin_summary", {}
+                        ).get("proto_margin_positive_rate_mean", np.nan),
+                        "proto_margin_gap_mean": getattr(
+                            run_args, "proto_margin_summary", {}
+                        ).get("proto_margin_gap_mean", np.nan),
                     })
                     print(f"[done] {tag} -> acc={acc:.4f} ({elapsed}s, {status})")
 
