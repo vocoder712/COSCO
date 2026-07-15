@@ -113,6 +113,86 @@ def _prototype_geometry_stress(embed, labels, eps=1e-12):
         return torch.nan_to_num(stress, nan=0.0, posinf=1e6, neginf=0.0)
 
 
+def _prototype_geometry_pressure(embed, labels, margin_target=0.35, eps=1e-12):
+    """Return a bounded, scale-free description of prototype geometry.
+
+    Unlike the legacy within/between distance ratio, prototype crowding remains
+    informative in the 1-shot case.  For multi-shot batches it is combined
+    with boundary-margin violations and within-class compactness.
+    """
+    with torch.no_grad():
+        labels = labels.squeeze().long()
+        unique_labels = torch.unique(labels, sorted=True)
+        zero = embed.new_tensor(0.0)
+        if unique_labels.numel() < 2:
+            return {
+                "pressure": zero,
+                "boundary": zero,
+                "crowding": zero,
+                "compactness": zero,
+            }
+
+        centroids = []
+        target_indices = torch.empty_like(labels, dtype=torch.long)
+        has_within_class_geometry = False
+        for class_index, class_label in enumerate(unique_labels):
+            mask = labels == class_label
+            centroids.append(embed[mask].mean(dim=0))
+            target_indices[mask] = class_index
+            has_within_class_geometry |= int(mask.sum().item()) > 1
+        centroids = torch.stack(centroids, dim=0)
+
+        distances = torch.cdist(embed, centroids, p=2)
+        own = distances.gather(1, target_indices[:, None]).squeeze(1)
+        wrong_distances = distances.clone()
+        wrong_distances.scatter_(1, target_indices[:, None], float("inf"))
+        nearest_wrong = wrong_distances.min(dim=1).values
+
+        # Scale-free signed margin in [-1, 1]. A value below margin_target is
+        # treated as boundary pressure.
+        normalized_gap = (nearest_wrong - own) / (nearest_wrong + own + eps)
+        boundary = torch.relu(margin_target - normalized_gap).div(
+            max(margin_target, eps)
+        ).clamp(max=1.0).mean()
+        compactness = (own / (nearest_wrong + eps)).clamp(max=1.0).mean()
+
+        centroid_distances = torch.cdist(centroids, centroids, p=2)
+        eye = torch.eye(
+            centroids.shape[0], dtype=torch.bool, device=centroids.device
+        )
+        centroid_distances = centroid_distances.masked_fill(eye, float("nan"))
+        nearest_centroid, nearest_indices = torch.nan_to_num(
+            centroid_distances, nan=float("inf")
+        ).min(dim=1)
+        typical_centroid = torch.nanmean(centroid_distances, dim=1)
+        relative_crowding = (
+            1.0 - nearest_centroid / (typical_centroid + eps)
+        ).clamp(min=0.0, max=1.0)
+        centroid_norms = torch.linalg.vector_norm(centroids, dim=1)
+        nearest_scale = centroid_norms + centroid_norms[nearest_indices]
+        scale_crowding = (
+            1.0 - nearest_centroid / (nearest_scale + eps)
+        ).clamp(min=0.0, max=1.0)
+        crowding = (0.5 * relative_crowding + 0.5 * scale_crowding).mean()
+
+        if has_within_class_geometry:
+            pressure = 0.50 * boundary + 0.30 * crowding + 0.20 * compactness
+        else:
+            # Own-prototype distances are identically zero in 1-shot. Use the
+            # prototype arrangement itself instead of returning zero.
+            pressure = crowding
+
+        def finite(value):
+            return torch.nan_to_num(value, nan=0.0, posinf=1.0, neginf=0.0)
+
+        return {
+            "pressure": finite(pressure).clamp(0.0, 1.0),
+            "boundary": finite(boundary).clamp(0.0, 1.0),
+            "crowding": finite(crowding).clamp(0.0, 1.0),
+            "compactness": finite(compactness).clamp(0.0, 1.0),
+        }
+
+
 def _set_sam_rho(optimizer, rho):
     """Update rho for every SAM parameter group."""
     for group in optimizer.param_groups:
@@ -124,6 +204,17 @@ def _compute_dynamic_rho(base_rho, stress, alpha, min_ratio, max_ratio):
     min_rho = base_rho * min_ratio
     max_rho = base_rho * max_ratio
     return max(min(scaled_rho, max_rho), min_rho)
+
+
+def _compute_geometry_rho(base_rho, pressure, alpha, min_ratio, max_ratio,
+                          protect_threshold=0.70, protect_strength=0.25):
+    """Protective dynamic rho: boost moderate pressure, shrink at extremes."""
+    pressure = max(0.0, min(float(pressure), 1.0))
+    moderate_boost = alpha * 4.0 * pressure * (1.0 - pressure)
+    severe = max(0.0, pressure - protect_threshold)
+    severe /= max(1.0 - protect_threshold, 1e-12)
+    ratio = 1.0 + moderate_boost - protect_strength * severe
+    return base_rho * max(min(ratio, max_ratio), min_ratio)
 
 
 def fft_logmag_zscore_batch(inputs, eps=1e-8):
@@ -190,6 +281,15 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     dynamic_rho_alpha = float(getattr(args, 'dynamic_rho_alpha', 0.25))
     dynamic_rho_min_ratio = float(getattr(args, 'dynamic_rho_min_ratio', 0.5))
     dynamic_rho_max_ratio = float(getattr(args, 'dynamic_rho_max_ratio', 1.15))
+    dynamic_rho_mode = str(getattr(args, 'dynamic_rho_mode', 'legacy'))
+    geometry_ema_beta = float(getattr(args, 'geometry_ema_beta', 0.9))
+    geometry_margin_target = float(getattr(args, 'geometry_margin_target', 0.35))
+    geometry_protect_threshold = float(
+        getattr(args, 'geometry_protect_threshold', 0.35)
+    )
+    geometry_protect_strength = float(
+        getattr(args, 'geometry_protect_strength', 0.75)
+    )
     log_every = int(getattr(args, 'log_every', 1))
 
     runSAM = args.sam
@@ -223,6 +323,16 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
                 "dynamic_rho_min_ratio must be <= dynamic_rho_max_ratio, "
                 f"got {dynamic_rho_min_ratio} > {dynamic_rho_max_ratio}"
             )
+        if dynamic_rho_mode not in {'legacy', 'geometry_v2'}:
+            raise ValueError(f"unknown dynamic_rho_mode: {dynamic_rho_mode}")
+        if not 0.0 <= geometry_ema_beta < 1.0:
+            raise ValueError("geometry_ema_beta must be in [0, 1)")
+        if not 0.0 < geometry_margin_target <= 1.0:
+            raise ValueError("geometry_margin_target must be in (0, 1]")
+        if not 0.0 <= geometry_protect_threshold < 1.0:
+            raise ValueError("geometry_protect_threshold must be in [0, 1)")
+        if geometry_protect_strength < 0.0:
+            raise ValueError("geometry_protect_strength must be non-negative")
 
     # 模型搬到目标设备 / move model to target device
     model_resnet = model_resnet.to(device)
@@ -230,6 +340,10 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     args.proto_margin_summary = {}
     rho_trace = []
     stress_trace = []
+    boundary_trace = []
+    crowding_trace = []
+    compactness_trace = []
+    pressure_ema = None
     margin_base_loss_trace = []
     margin_loss_trace = []
     margin_total_loss_trace = []
@@ -261,7 +375,7 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
 
             # ResNet 输出: (logits, embedding)
             # `transpose(1, 2)` 把 (B, T, C) 转成 (B, C, T) 以适配 Conv1d.
-            outputs1 = model_resnet(torch.tensor(inputs).transpose(1, 2))
+            outputs1 = model_resnet(inputs.transpose(1, 2).float())
             outputs = outputs1[0]   # logits, 这里未使用 / unused here
             embed = outputs1[1]     # 嵌入向量, 输入原型损失 / embedding fed to ProtoLoss
 
@@ -278,14 +392,46 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
                 margin_gap_trace.append(float(criterion.last_mean_margin_gap))
             loss.backward()
             if dynamic_rho:
-                stress = float(_prototype_geometry_stress(embed.detach(), labels.detach()).item())
-                current_rho = _compute_dynamic_rho(
-                    rho,
-                    stress,
-                    dynamic_rho_alpha,
-                    dynamic_rho_min_ratio,
-                    dynamic_rho_max_ratio,
-                )
+                if dynamic_rho_mode == 'geometry_v2':
+                    geometry = _prototype_geometry_pressure(
+                        embed.detach(),
+                        labels.detach(),
+                        margin_target=geometry_margin_target,
+                    )
+                    raw_pressure = float(geometry['pressure'].item())
+                    if pressure_ema is None:
+                        pressure_ema = raw_pressure
+                    else:
+                        pressure_ema = (
+                            geometry_ema_beta * pressure_ema
+                            + (1.0 - geometry_ema_beta) * raw_pressure
+                        )
+                    stress = pressure_ema
+                    current_rho = _compute_geometry_rho(
+                        rho,
+                        stress,
+                        dynamic_rho_alpha,
+                        dynamic_rho_min_ratio,
+                        dynamic_rho_max_ratio,
+                        geometry_protect_threshold,
+                        geometry_protect_strength,
+                    )
+                    boundary_trace.append(float(geometry['boundary'].item()))
+                    crowding_trace.append(float(geometry['crowding'].item()))
+                    compactness_trace.append(float(geometry['compactness'].item()))
+                else:
+                    stress = float(
+                        _prototype_geometry_stress(
+                            embed.detach(), labels.detach()
+                        ).item()
+                    )
+                    current_rho = _compute_dynamic_rho(
+                        rho,
+                        stress,
+                        dynamic_rho_alpha,
+                        dynamic_rho_min_ratio,
+                        dynamic_rho_max_ratio,
+                    )
                 _set_sam_rho(optimizer, current_rho)
                 rho_trace.append(current_rho)
                 stress_trace.append(stress)
@@ -294,7 +440,7 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
             # ---------- SAM 第二次 forward-backward / second SAM step ----------
             disable_running_stats(model_resnet)  # 冻结 BN 统计
             tmp = criterion(
-                model_resnet(torch.tensor(inputs).transpose(1, 2).float())[1],
+                model_resnet(inputs.transpose(1, 2).float())[1],
                 labels,
             )
             tmp.backward()
@@ -336,6 +482,7 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
     print('Finished Training')
     if dynamic_rho and rho_trace:
         args.dynamic_rho_summary = {
+            "dynamic_rho_mode": dynamic_rho_mode,
             "rho_min": float(np.min(rho_trace)),
             "rho_mean": float(np.mean(rho_trace)),
             "rho_max": float(np.max(rho_trace)),
@@ -343,6 +490,12 @@ def proto_neg_train_model(trainloader, train_label, test_data, test_label, input
             "proto_stress_mean": float(np.mean(stress_trace)),
             "proto_stress_final": float(stress_trace[-1]),
         }
+        if boundary_trace:
+            args.dynamic_rho_summary.update({
+                "geometry_boundary_mean": float(np.mean(boundary_trace)),
+                "geometry_crowding_mean": float(np.mean(crowding_trace)),
+                "geometry_compactness_mean": float(np.mean(compactness_trace)),
+            })
     if margin_loss_trace:
         args.proto_margin_summary = {
             "proto_margin_base_loss_mean": float(np.mean(margin_base_loss_trace)),

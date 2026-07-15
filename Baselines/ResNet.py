@@ -3,9 +3,7 @@ import torch
 from torch import nn
 from torch import optim
 import torch.nn.functional as F
-from torchvision import datasets, transforms, models
 from torch.nn.modules.batchnorm import _BatchNorm
-import pandas as pd
 import torch.nn as nn
 import os
 import uuid

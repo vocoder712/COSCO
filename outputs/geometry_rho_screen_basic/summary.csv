@@ -1,0 +1,7 @@
+dataset,shot,model,accuracy_mean,accuracy_std,successful_runs,elapsed_mean_sec,rho_mean,pressure_mean,boundary_mean,crowding_mean,compactness_mean
+BasicMotions,1,cosco,1.0,0.0,3,0.36000000000000004,,,,,
+BasicMotions,1,cosco_dynamic_rho,1.0,0.0,3,0.3833333333333333,0.10000000000000002,0.0,,,
+BasicMotions,1,cosco_geometry_rho,1.0,0.0,3,0.41333333333333333,0.11499999999999999,0.6335268580615521,0.0,0.599144434928894,0.0
+BasicMotions,10,cosco,1.0,0.0,3,2.026666666666667,,,,,
+BasicMotions,10,cosco_dynamic_rho,1.0,0.0,3,2.0333333333333337,0.10955925601224104,0.38237024048964185,,,
+BasicMotions,10,cosco_geometry_rho,1.0,0.0,3,2.0533333333333332,0.11499999999999999,0.3406481810188294,0.0917008890459935,0.628485232591629,0.3475123415390651

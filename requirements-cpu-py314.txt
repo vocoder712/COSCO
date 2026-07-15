@@ -1,0 +1,16 @@
+# Minimal CPU-only stack for the local Python 3.14 / venv workflow.
+# TapNet is intentionally excluded because its old TensorFlow/aeon stack is
+# tied to the legacy Python 3.11 environment documented in USAGE.md.
+numpy>=2.5,<3
+pandas>=3.0,<4
+scikit-learn>=1.9,<2
+tabulate>=0.10,<1
+# Install these from the configured PyPI mirror first, then install the torch
+# wheel from the official CPU index with --no-deps (see USAGE.md).
+filelock>=3.29
+typing-extensions>=4.15
+setuptools>=78
+sympy>=1.14,<1.15
+networkx>=3.6,<4
+jinja2>=3.1,<4
+fsspec>=2026.4

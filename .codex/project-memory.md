@@ -1,6 +1,6 @@
 # COSCO Project Memory
 
-Last updated: 2026-06-28
+Last updated: 2026-07-15
 
 This file is persistent local memory for future Codex conversations in this
 repository. Read it before making changes or answering project-specific
@@ -155,6 +155,38 @@ questions.
   the active COSCO path does not use that trainer.
 
 ## Current Outputs
+
+### 2026-07-15 Duet CPU / geometry-rho v2 iteration
+
+- Current workspace is `D:\proj\COSCO` on a Duet tablet with no discrete GPU
+  and no Conda. The working environment is `.venv`, Python 3.14.3,
+  PyTorch 2.13.0+cpu, NumPy 2.5.1, pandas 3.0.3, scikit-learn 1.9.0.
+- `requirements-cpu-py314.txt` and the new top section in `USAGE.md` document
+  the lightweight venv installation. Install the PyTorch wheel from its
+  official CPU index; the PyPI large-file endpoint stalled on this machine.
+- Removed unused torchvision imports from `Baselines/ResNet.py`,
+  `Prototypical_Loss.py`, and `SAM.py`; torchvision is not needed by COSCO.
+- Added `cosco_geometry_rho`, which combines normalized nearest-wrong boundary
+  pressure, prototype crowding, and within-class compactness. Prototype
+  crowding remains nonzero for 1-shot. Pressure is EMA-smoothed.
+- Geometry-v2 rho is protective: moderate/low pressure can boost rho, while
+  high pressure shrinks it. Selected CPU-screen defaults are alpha 0.15,
+  EMA beta 0.9, margin target 0.35, protect threshold 0.35, protect strength
+  0.75, min/max rho ratios 0.75/1.15.
+- Added `compare_dynamic_rho_multiseed.py`. It requires exactly three seeds,
+  uses paired model initialization/shuffle seeds, and writes raw runs,
+  mean/std summaries, and paired deltas.
+- 30-epoch three-seed verification covered Heartbeat, RacketSports, and
+  JapaneseVowels at 1/10-shot (six tasks, 18 runs per method). Macro accuracy:
+  COSCO 0.724624, geometry-v2 0.728531, delta +0.003907, wins/losses 4/2.
+  Biggest gain was RacketSports 10-shot +0.024123; remaining drops were
+  RacketSports 1-shot -0.010965 and JapaneseVowels 10-shot -0.004505.
+- Full report: `outputs/geometry_rho_v2_report.md`. This is a positive research
+  baseline, not yet the requested large improvement and not a 100-epoch/full
+  21-dataset paper-quality benchmark.
+- Next recommended method step: combine geometry pressure with its temporal
+  trend or a measured SAM sharpness gap, because absolute pressure alone does
+  not predict the best rho on the two remaining negative tasks.
 
 - Current `outputs/comparison/summary.md` is for `SpokenArabicDigits`, 100
   epochs, torch `2.5.1+cu124`, device `NVIDIA GeForce RTX 4060 Laptop GPU`.

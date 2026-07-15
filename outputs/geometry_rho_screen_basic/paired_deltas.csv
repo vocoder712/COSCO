@@ -1,0 +1,7 @@
+dataset,shot,base_seed,cosco,cosco_dynamic_rho,cosco_geometry_rho,cosco_dynamic_rho_minus_cosco,cosco_geometry_rho_minus_cosco
+BasicMotions,1,10,1.0,1.0,1.0,0.0,0.0
+BasicMotions,1,20,1.0,1.0,1.0,0.0,0.0
+BasicMotions,1,30,1.0,1.0,1.0,0.0,0.0
+BasicMotions,10,10,1.0,1.0,1.0,0.0,0.0
+BasicMotions,10,20,1.0,1.0,1.0,0.0,0.0
+BasicMotions,10,30,1.0,1.0,1.0,0.0,0.0

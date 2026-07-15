@@ -1,5 +1,44 @@
 # COSCO 使用说明 / Usage Guide
 
+## 当前 Duet 平板环境（CPU + Python 3.14）
+
+本仓库当前机器没有独立显卡或 Conda。原有的 Python 3.11/CUDA 说明保留在
+下文，当前开发与动态 rho 实验使用仓库内 venv：
+
+```powershell
+# WindowsApps 的 python.exe 可能只是占位程序；必要时使用真实解释器绝对路径
+& 'C:\Users\vocoder712\AppData\Local\Python\bin\python.exe' -m venv .venv
+# 仅对当前 venv 使用清华 PyPI 镜像，不修改系统级 pip 配置
+.\.venv\Scripts\python.exe -m pip config --site set `
+  global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+.\.venv\Scripts\python.exe -m pip install -r requirements-cpu-py314.txt
+
+# PyTorch CPU wheel 使用官方专用索引
+.\.venv\Scripts\python.exe -m pip install --no-deps `
+  --index-url https://download.pytorch.org/whl/cpu torch
+
+# 强制三 seed 成对实验，输出均值、标准差和逐 seed 差值
+.\.venv\Scripts\python.exe compare_dynamic_rho_multiseed.py `
+  --datasets BasicMotions RacketSports `
+  --shots 1 10 `
+  --models cosco cosco_dynamic_rho cosco_geometry_rho `
+  --seeds 10 20 30 `
+  --nEpoch 30 `
+  --threads 4 `
+  --out_dir outputs/dynamic_rho_multiseed/
+```
+
+`cosco_geometry_rho` 是深化版原型几何压力：综合归一化分类边界压力、
+原型拥挤度和类内紧致度，并用 EMA 平滑。它在 1-shot 时依靠原型拥挤度，
+不会像旧压力那样恒为零；rho 对中等压力适度增加，对极高压力保护性回落。
+专用脚本要求 `--seeds` 恰好提供三个值，每个模型使用相同的初始化和
+DataLoader shuffle seed，因此差值是成对可比的。
+
+> Python 3.14 CPU 环境只覆盖 COSCO/ResNet 实验。旧版 TapNet 依赖
+> aeon 0.11 + TensorFlow 2.15，不属于这个轻量 venv。
+
+---
+
 > 本文档说明如何在本机 (Windows + RTX 4060 + CUDA 12.x) 上完成
 > COSCO 框架与 TapNet 基线的对比实验, 包括环境搭建、训练、推理、评估
 > 与结果可视化. 本文档与原仓库的 `README.md` 互补, README 偏向论文复

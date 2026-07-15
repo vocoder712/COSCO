@@ -41,6 +41,7 @@ MODEL_CHOICES = [
     "cosco",
     "cosco_weighted",
     "cosco_dynamic_rho",
+    "cosco_geometry_rho",
     "cosco_fft_reg",
     "cosco_proto_margin",
     "cosco_proto_margin_fft_reg",
@@ -93,10 +94,29 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         dummy_cosco_improvement=args.dummy_cosco_improvement,
         weighted_proto_gamma=args.weighted_proto_gamma,
         weighted_proto_mode=args.weighted_proto_mode,
-        dynamic_rho=(model == "cosco_dynamic_rho"),
-        dynamic_rho_alpha=args.dynamic_rho_alpha,
-        dynamic_rho_min_ratio=args.dynamic_rho_min_ratio,
+        dynamic_rho=(model in {"cosco_dynamic_rho", "cosco_geometry_rho"}),
+        dynamic_rho_mode=(
+            "geometry_v2" if model == "cosco_geometry_rho" else "legacy"
+        ),
+        dynamic_rho_alpha=(
+            args.geometry_rho_alpha
+            if model == "cosco_geometry_rho"
+            else args.dynamic_rho_alpha
+        ),
+        dynamic_rho_min_ratio=(
+            args.geometry_rho_min_ratio
+            if model == "cosco_geometry_rho"
+            else args.dynamic_rho_min_ratio
+        ),
         dynamic_rho_max_ratio=args.dynamic_rho_max_ratio,
+        geometry_ema_beta=getattr(args, "geometry_ema_beta", 0.9),
+        geometry_margin_target=getattr(args, "geometry_margin_target", 0.35),
+        geometry_protect_threshold=getattr(
+            args, "geometry_protect_threshold", 0.35
+        ),
+        geometry_protect_strength=getattr(
+            args, "geometry_protect_strength", 0.75
+        ),
         dynamic_rho_summary={},
         log_every=args.log_every,
         seed=args.seed,
@@ -366,7 +386,7 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_weighted":
         return run_cosco_weighted(train_data, train_label, test_data, test_label,
                                   input_size, run_args)
-    if run_args.model == "cosco_dynamic_rho":
+    if run_args.model in {"cosco_dynamic_rho", "cosco_geometry_rho"}:
         return run_cosco_dynamic_rho(train_data, train_label, test_data, test_label,
                                      input_size, run_args)
     if run_args.model == "cosco_fft_reg":
@@ -652,10 +672,22 @@ def main() -> None:
                         help="'close' uses softmax(-distance/gamma); 'far' uses softmax(distance/gamma).")
     parser.add_argument("--dynamic_rho_alpha", type=float, default=0.25,
                         help="Prototype-geometry stress multiplier for dynamic SAM rho.")
+    parser.add_argument("--geometry_rho_alpha", type=float, default=0.15,
+                        help="Moderate-pressure boost used by cosco_geometry_rho.")
+    parser.add_argument("--geometry_rho_min_ratio", type=float, default=0.75,
+                        help="Minimum rho/base-rho ratio for cosco_geometry_rho.")
     parser.add_argument("--dynamic_rho_min_ratio", type=float, default=0.5,
                         help="Minimum dynamic rho as a ratio of --rho.")
     parser.add_argument("--dynamic_rho_max_ratio", type=float, default=1.15,
                         help="Maximum dynamic rho as a ratio of --rho.")
+    parser.add_argument("--geometry_ema_beta", type=float, default=0.9,
+                        help="EMA smoothing for geometry-v2 pressure.")
+    parser.add_argument("--geometry_margin_target", type=float, default=0.35,
+                        help="Target normalized prototype margin for geometry-v2.")
+    parser.add_argument("--geometry_protect_threshold", type=float, default=0.35,
+                        help="Pressure where geometry-v2 starts shrinking rho.")
+    parser.add_argument("--geometry_protect_strength", type=float, default=0.75,
+                        help="Maximum high-pressure rho shrinkage.")
     parser.add_argument("--fft_reg_lambdas", nargs="+", type=float,
                         default=[0.1],
                         help="Auxiliary FFT prototypical-loss weights for cosco_fft_reg.")
@@ -754,8 +786,8 @@ def main() -> None:
                                 f"weighted_{args.weighted_proto_mode}_gamma={args.weighted_proto_gamma}"
                                 if model == "cosco_weighted"
                                 else (
-                                    f"dynamic_rho_proto_geometry_alpha={args.dynamic_rho_alpha}"
-                                    if model == "cosco_dynamic_rho"
+                                    f"dynamic_rho_{run_args.dynamic_rho_mode}_alpha={run_args.dynamic_rho_alpha}"
+                                    if model in {"cosco_dynamic_rho", "cosco_geometry_rho"}
                                     else (
                                         f"fft_reg_lambda={fft_lambda_key(fft_reg_lambda)}"
                                         if is_fft_reg_model
@@ -774,6 +806,9 @@ def main() -> None:
                         "rho_final": dynamic_summary.get("rho_final", np.nan),
                         "proto_stress_mean": dynamic_summary.get("proto_stress_mean", np.nan),
                         "proto_stress_final": dynamic_summary.get("proto_stress_final", np.nan),
+                        "geometry_boundary_mean": dynamic_summary.get("geometry_boundary_mean", np.nan),
+                        "geometry_crowding_mean": dynamic_summary.get("geometry_crowding_mean", np.nan),
+                        "geometry_compactness_mean": dynamic_summary.get("geometry_compactness_mean", np.nan),
                         "fft_reg_lambda": (
                             float(fft_reg_lambda)
                             if is_fft_reg_model
