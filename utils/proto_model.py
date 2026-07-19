@@ -587,6 +587,32 @@ def margin_proto_neg_train_model(trainloader, train_label, test_data, test_label
     )
 
 
+def margin_geometry_proto_neg_train_model(trainloader, train_label, test_data,
+                                          test_label, input_size, args):
+    """Combine the prototype-boundary loss with geometry-v2 dynamic SAM rho."""
+    margin = float(getattr(args, 'proto_margin_value', 0.0))
+    beta = float(getattr(args, 'proto_margin_beta', 0.05))
+    criterion = MarginPrototypicalLoss(
+        flag='neg',
+        margin=margin,
+        beta=beta,
+    )
+    if not bool(getattr(args, 'dynamic_rho', False)):
+        raise ValueError("margin_geometry variant requires dynamic_rho=True")
+    if str(getattr(args, 'dynamic_rho_mode', '')) != 'geometry_v2':
+        raise ValueError("margin_geometry variant requires geometry_v2 rho mode")
+    return proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+        criterion_override=criterion,
+        centroid_path='train_centroids_margin_geometry_rho.pt',
+    )
+
+
 def fft_regularized_proto_neg_train_model(trainloader, train_label, test_data, test_label, input_size, args):
     """
     仅将 FFT 视图用作训练正则化项。 

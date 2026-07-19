@@ -37,6 +37,30 @@ DataLoader shuffle seed，因此差值是成对可比的。
 > Python 3.14 CPU 环境只覆盖 COSCO/ResNet 实验。旧版 TapNet 依赖
 > aeon 0.11 + TensorFlow 2.15，不属于这个轻量 venv。
 
+### 原型边界损失 × geometry-v2 消融
+
+组合模型为 `cosco_proto_margin_geometry_rho`。当前三 seed CPU 消融选择
+`margin=0, beta=0.025`；较大的历史默认 `beta=0.05` 会在 Heartbeat
+10-shot 上让边界项主导并覆盖 geometry-v2 的收益。
+
+```powershell
+.\.venv\Scripts\python.exe compare_dynamic_rho_multiseed.py `
+  --datasets RacketSports Heartbeat JapaneseVowels `
+  --shots 1 10 `
+  --models cosco cosco_proto_margin cosco_geometry_rho `
+           cosco_proto_margin_geometry_rho `
+  --seeds 10 20 30 `
+  --nEpoch 30 `
+  --proto_margin_value 0 `
+  --proto_margin_beta 0.025 `
+  --threads 4 `
+  --out_dir outputs/margin_geometry_ablation/
+```
+
+完整消融及五数据集外推结论见
+`outputs/margin_geometry_ablation_report.md`；统一十任务表见
+`outputs/margin_geometry_5datasets_summary.csv`。
+
 ---
 
 > 本文档说明如何在本机 (Windows + RTX 4060 + CUDA 12.x) 上完成

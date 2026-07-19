@@ -1,4 +1,4 @@
-"""CPU-friendly paired three-seed benchmark for COSCO dynamic-rho variants."""
+"""CPU-friendly paired three-seed ablation for COSCO geometry variants."""
 
 import argparse
 import os
@@ -12,7 +12,17 @@ import torch
 from compare_quick_bench import make_run_args, run_single, set_seed, stable_run_seed
 
 
-MODELS = ["cosco", "cosco_dynamic_rho", "cosco_geometry_rho"]
+ABLATION_MODELS = [
+    "cosco",
+    "cosco_proto_margin",
+    "cosco_geometry_rho",
+    "cosco_proto_margin_geometry_rho",
+]
+MODELS = ABLATION_MODELS + ["cosco_dynamic_rho"]
+MARGIN_MODELS = {
+    "cosco_proto_margin",
+    "cosco_proto_margin_geometry_rho",
+}
 
 
 def build_shared_args(cli):
@@ -35,8 +45,8 @@ def build_shared_args(cli):
         geometry_protect_threshold=cli.geometry_protect_threshold,
         geometry_protect_strength=cli.geometry_protect_strength,
         fft_reg_lambdas=[0.1],
-        proto_margin_values=[0.0],
-        proto_margin_betas=[0.05],
+        proto_margin_values=[cli.proto_margin_value],
+        proto_margin_betas=[cli.proto_margin_beta],
         log_every=cli.log_every,
         seed=cli.seeds[0],
     )
@@ -44,11 +54,11 @@ def build_shared_args(cli):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Paired multi-seed benchmark for dynamic SAM rho."
+        description="Paired multi-seed ablation for margin loss and geometry rho."
     )
     parser.add_argument("--datasets", nargs="+", default=["BasicMotions", "RacketSports"])
     parser.add_argument("--shots", nargs="+", type=int, choices=[1, 10], default=[1, 10])
-    parser.add_argument("--models", nargs="+", choices=MODELS, default=MODELS)
+    parser.add_argument("--models", nargs="+", choices=MODELS, default=ABLATION_MODELS)
     parser.add_argument("--seeds", nargs=3, type=int, default=[10, 20, 30],
                         metavar=("SEED1", "SEED2", "SEED3"))
     parser.add_argument("--nEpoch", type=int, default=30)
@@ -61,6 +71,8 @@ def main():
     parser.add_argument("--geometry_margin_target", type=float, default=0.35)
     parser.add_argument("--geometry_protect_threshold", type=float, default=0.35)
     parser.add_argument("--geometry_protect_strength", type=float, default=0.75)
+    parser.add_argument("--proto_margin_value", type=float, default=0.0)
+    parser.add_argument("--proto_margin_beta", type=float, default=0.025)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--deterministic_torch", action="store_true", default=True)
     parser.add_argument("--threads", type=int, default=4)
@@ -80,7 +92,17 @@ def main():
                 for model in cli.models:
                     set_seed(paired_seed, cli.deterministic_torch)
                     shared.seed = base_seed
-                    run_args = make_run_args(shared, dataset, shot, model)
+                    if model in MARGIN_MODELS:
+                        run_args = make_run_args(
+                            shared,
+                            dataset,
+                            shot,
+                            model,
+                            proto_margin_value=cli.proto_margin_value,
+                            proto_margin_beta=cli.proto_margin_beta,
+                        )
+                    else:
+                        run_args = make_run_args(shared, dataset, shot, model)
                     started = time.time()
                     try:
                         accuracy = run_single(run_args)
@@ -89,6 +111,7 @@ def main():
                         accuracy = float("nan")
                         status = f"failed: {type(exc).__name__}: {exc}"
                     geometry = getattr(run_args, "dynamic_rho_summary", {}) or {}
+                    margin = getattr(run_args, "proto_margin_summary", {}) or {}
                     rows.append({
                         "dataset": dataset,
                         "shot": shot,
@@ -105,6 +128,11 @@ def main():
                         "boundary_mean": geometry.get("geometry_boundary_mean", np.nan),
                         "crowding_mean": geometry.get("geometry_crowding_mean", np.nan),
                         "compactness_mean": geometry.get("geometry_compactness_mean", np.nan),
+                        "margin_loss_mean": margin.get("proto_margin_loss_mean", np.nan),
+                        "margin_active_rate": margin.get(
+                            "proto_margin_positive_rate_mean", np.nan
+                        ),
+                        "margin_gap_mean": margin.get("proto_margin_gap_mean", np.nan),
                     })
                     print(
                         f"[done] {dataset} {shot}-shot seed={base_seed} {model}: "
@@ -126,6 +154,9 @@ def main():
         boundary_mean=("boundary_mean", "mean"),
         crowding_mean=("crowding_mean", "mean"),
         compactness_mean=("compactness_mean", "mean"),
+        margin_loss_mean=("margin_loss_mean", "mean"),
+        margin_active_rate=("margin_active_rate", "mean"),
+        margin_gap_mean=("margin_gap_mean", "mean"),
     )
     summary.to_csv(os.path.join(cli.out_dir, "summary.csv"), index=False)
 
@@ -138,21 +169,56 @@ def main():
     for model in cli.models:
         if model != "cosco" and {"cosco", model}.issubset(paired.columns):
             paired[f"{model}_minus_cosco"] = paired[model] - paired["cosco"]
+    required = set(ABLATION_MODELS)
+    if required.issubset(paired.columns):
+        paired["combination_synergy"] = (
+            paired["cosco_proto_margin_geometry_rho"]
+            - paired["cosco_proto_margin"]
+            - paired["cosco_geometry_rho"]
+            + paired["cosco"]
+        )
+        paired["combination_minus_best_component"] = (
+            paired["cosco_proto_margin_geometry_rho"]
+            - paired[["cosco_proto_margin", "cosco_geometry_rho"]].max(axis=1)
+        )
     paired.to_csv(os.path.join(cli.out_dir, "paired_deltas.csv"), index=False)
 
+    effect_columns = [
+        column for column in paired.columns
+        if column.endswith("_minus_cosco")
+        or column in {"combination_synergy", "combination_minus_best_component"}
+    ]
+    if effect_columns:
+        effects = paired.groupby(["dataset", "shot"], as_index=False)[
+            effect_columns
+        ].mean()
+    else:
+        effects = pd.DataFrame()
+    effects.to_csv(os.path.join(cli.out_dir, "ablation_effects.csv"), index=False)
+
     with open(os.path.join(cli.out_dir, "summary.md"), "w", encoding="utf-8") as handle:
-        handle.write("# Dynamic rho multi-seed benchmark\n\n")
+        handle.write("# Prototype-margin × geometry-rho multi-seed ablation\n\n")
         handle.write(f"- device: CPU; torch `{torch.__version__}`; threads: `{cli.threads}`\n")
         handle.write(f"- epochs: `{cli.nEpoch}`; seeds: `{cli.seeds}`\n")
+        handle.write(
+            f"- prototype margin: `{cli.proto_margin_value}`; "
+            f"beta: `{cli.proto_margin_beta}`\n"
+        )
         handle.write("- all model comparisons use paired initialization/shuffle seeds\n\n")
         handle.write("## Three-seed mean and standard deviation\n\n")
         handle.write(summary.to_markdown(index=False, floatfmt=".6f"))
+        if not effects.empty:
+            handle.write("\n\n## Mean ablation effects\n\n")
+            handle.write(effects.to_markdown(index=False, floatfmt=".6f"))
         handle.write("\n\n## Paired per-seed deltas\n\n")
         handle.write(paired.to_markdown(index=False, floatfmt=".6f"))
         handle.write("\n")
 
     print("\n=== three-seed summary ===")
     print(summary.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    if not effects.empty:
+        print("\n=== mean ablation effects ===")
+        print(effects.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
 
 
 if __name__ == "__main__":

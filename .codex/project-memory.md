@@ -1,6 +1,6 @@
 # COSCO Project Memory
 
-Last updated: 2026-07-15
+Last updated: 2026-07-19
 
 This file is persistent local memory for future Codex conversations in this
 repository. Read it before making changes or answering project-specific
@@ -155,6 +155,43 @@ questions.
   the active COSCO path does not use that trainer.
 
 ## Current Outputs
+
+### 2026-07-19 prototype-margin × geometry-rho ablation
+
+- Historical margin implementation came from commit `b55c471`. The auxiliary
+  loss is `beta * relu(margin + d_own - d_nearest_wrong)`. Historical single-
+  seed grid best was margin 0, beta 0.05, but this beta was too strong when
+  combined with geometry-v2 on Heartbeat 10-shot.
+- Added model `cosco_proto_margin_geometry_rho`. It uses
+  `MarginPrototypicalLoss` for both SAM passes while geometry-v2 adapts rho.
+- Extended `compare_dynamic_rho_multiseed.py` to run the four-way paired
+  ablation (COSCO, margin only, geometry only, combination), record both margin
+  and geometry diagnostics, and compute strict additive synergy.
+- Full beta 0.05 ablation: six-task macro COSCO 0.724624, margin 0.728282,
+  geometry 0.728531, combination 0.728958. Ten-shot strict synergy was
+  negative (-0.006462), showing strong mechanism overlap / margin dominance.
+- Selected combined beta is 0.025. Three-task 10-shot macro: COSCO 0.804182,
+  margin 0.809357, geometry 0.811805, combination 0.816661. Combination delta
+  over COSCO is +0.012480 and over geometry is +0.004856. Strict additive
+  synergy is near zero (-0.000319), so the gain stacks in macro accuracy but
+  is not super-additive.
+- With 1-shot included (margin=0 makes the boundary term exactly inactive),
+  six-task macro for the selected combination is 0.730959 vs COSCO 0.724624,
+  delta +0.006335. Largest gain is RacketSports 10-shot +0.035088;
+  JapaneseVowels 10-shot remains slightly negative (-0.000901).
+- Report: `outputs/margin_geometry_ablation_report.md`. Raw results:
+  `outputs/margin_geometry_ablation_30ep/` and
+  `outputs/margin_geometry_ablation_beta0025_30ep/`.
+- External reassessment added Epilepsy and NATOPS without retuning, producing
+  five datasets / ten tasks total. Macro means: COSCO 0.739041, margin-only
+  0.740296, geometry-only 0.739872, combination 0.741441. Combination delta is
+  +0.002400 with task wins/losses 6/4. Dataset-level results are positive on
+  Epilepsy, Heartbeat, JapaneseVowels, and RacketSports, but negative on
+  NATOPS. NATOPS deltas are -0.011111 (1-shot) and -0.022222 (10-shot).
+- The external check materially weakens the claim: the combination is still
+  the best fixed macro method, but only by a small amount and with four losing
+  tasks. Unified table: `outputs/margin_geometry_5datasets_summary.csv`; new
+  raw runs: `outputs/margin_geometry_external_2datasets_30ep/`.
 
 ### 2026-07-15 Duet CPU / geometry-rho v2 iteration
 

@@ -27,6 +27,7 @@ from utils.load_data import Dataset, load_data
 from utils.proto_model import (
     fft_regularized_proto_neg_train_model,
     margin_fft_regularized_proto_neg_train_model,
+    margin_geometry_proto_neg_train_model,
     margin_proto_neg_train_model,
     proto_neg_train_model,
     weighted_proto_neg_train_model,
@@ -44,6 +45,7 @@ MODEL_CHOICES = [
     "cosco_geometry_rho",
     "cosco_fft_reg",
     "cosco_proto_margin",
+    "cosco_proto_margin_geometry_rho",
     "cosco_proto_margin_fft_reg",
 ]
 
@@ -94,18 +96,24 @@ def make_run_args(args: argparse.Namespace, dataset: str, shot: int,
         dummy_cosco_improvement=args.dummy_cosco_improvement,
         weighted_proto_gamma=args.weighted_proto_gamma,
         weighted_proto_mode=args.weighted_proto_mode,
-        dynamic_rho=(model in {"cosco_dynamic_rho", "cosco_geometry_rho"}),
+        dynamic_rho=(model in {
+            "cosco_dynamic_rho",
+            "cosco_geometry_rho",
+            "cosco_proto_margin_geometry_rho",
+        }),
         dynamic_rho_mode=(
-            "geometry_v2" if model == "cosco_geometry_rho" else "legacy"
+            "geometry_v2"
+            if model in {"cosco_geometry_rho", "cosco_proto_margin_geometry_rho"}
+            else "legacy"
         ),
         dynamic_rho_alpha=(
             args.geometry_rho_alpha
-            if model == "cosco_geometry_rho"
+            if model in {"cosco_geometry_rho", "cosco_proto_margin_geometry_rho"}
             else args.dynamic_rho_alpha
         ),
         dynamic_rho_min_ratio=(
             args.geometry_rho_min_ratio
-            if model == "cosco_geometry_rho"
+            if model in {"cosco_geometry_rho", "cosco_proto_margin_geometry_rho"}
             else args.dynamic_rho_min_ratio
         ),
         dynamic_rho_max_ratio=args.dynamic_rho_max_ratio,
@@ -347,6 +355,26 @@ def run_cosco_proto_margin(train_data: np.ndarray, train_label: np.ndarray,
     ))
 
 
+def run_cosco_proto_margin_geometry_rho(
+        train_data: np.ndarray, train_label: np.ndarray,
+        test_data: np.ndarray, test_label: np.ndarray,
+        input_size: int, args: Namespace) -> float:
+    trainloader = DataLoader(
+        Dataset(train_data, train_label),
+        batch_size=1024,
+        shuffle=True,
+        num_workers=0,
+    )
+    return float(margin_geometry_proto_neg_train_model(
+        trainloader,
+        train_label,
+        test_data,
+        test_label,
+        input_size,
+        args,
+    ))
+
+
 def run_cosco_proto_margin_fft_reg(train_data: np.ndarray, train_label: np.ndarray,
                                    test_data: np.ndarray, test_label: np.ndarray,
                                    input_size: int, args: Namespace) -> float:
@@ -395,6 +423,10 @@ def run_single(run_args: Namespace) -> float:
     if run_args.model == "cosco_proto_margin":
         return run_cosco_proto_margin(train_data, train_label, test_data, test_label,
                                       input_size, run_args)
+    if run_args.model == "cosco_proto_margin_geometry_rho":
+        return run_cosco_proto_margin_geometry_rho(
+            train_data, train_label, test_data, test_label, input_size, run_args
+        )
     if run_args.model == "cosco_proto_margin_fft_reg":
         return run_cosco_proto_margin_fft_reg(train_data, train_label, test_data,
                                               test_label, input_size, run_args)
@@ -515,7 +547,11 @@ def write_outputs(df: pd.DataFrame, args: argparse.Namespace,
             ["dataset", "shot", "accuracy"],
         ].rename(columns={"accuracy": "cosco"})
         margin_rows = df.loc[
-            df["model"].isin(["cosco_proto_margin", "cosco_proto_margin_fft_reg"]),
+            df["model"].isin([
+                "cosco_proto_margin",
+                "cosco_proto_margin_fft_reg",
+                "cosco_proto_margin_geometry_rho",
+            ]),
             [
                 "model",
                 "dataset",
@@ -715,7 +751,11 @@ def main() -> None:
         for shot in args.shots:
             for model in args.models:
                 is_fft_reg_model = model in {"cosco_fft_reg", "cosco_proto_margin_fft_reg"}
-                is_proto_margin_model = model in {"cosco_proto_margin", "cosco_proto_margin_fft_reg"}
+                is_proto_margin_model = model in {
+                    "cosco_proto_margin",
+                    "cosco_proto_margin_fft_reg",
+                    "cosco_proto_margin_geometry_rho",
+                }
                 lambda_values = args.fft_reg_lambdas if is_fft_reg_model else [np.nan]
                 margin_values = args.proto_margin_values if is_proto_margin_model else [np.nan]
                 beta_values = args.proto_margin_betas if is_proto_margin_model else [np.nan]
@@ -787,7 +827,11 @@ def main() -> None:
                                 if model == "cosco_weighted"
                                 else (
                                     f"dynamic_rho_{run_args.dynamic_rho_mode}_alpha={run_args.dynamic_rho_alpha}"
-                                    if model in {"cosco_dynamic_rho", "cosco_geometry_rho"}
+                                    if model in {
+                                        "cosco_dynamic_rho",
+                                        "cosco_geometry_rho",
+                                        "cosco_proto_margin_geometry_rho",
+                                    }
                                     else (
                                         f"fft_reg_lambda={fft_lambda_key(fft_reg_lambda)}"
                                         if is_fft_reg_model
